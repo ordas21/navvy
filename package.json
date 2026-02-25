@@ -1,0 +1,14 @@
+{
+  "name": "claude-browser-agent",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "server",
+    "mcp-server"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "dev": "npm run dev --workspace=server",
+    "setup": "bash setup.sh"
+  }
+}

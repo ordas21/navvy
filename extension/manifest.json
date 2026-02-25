@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Claude Browser Agent",
+  "version": "1.0.0",
+  "description": "AI-powered browser automation agent using Claude",
+  "permissions": [
+    "sidePanel",
+    "activeTab",
+    "tabs",
+    "storage"
+  ],
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Claude Browser Agent"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
