@@ -5,6 +5,7 @@ interface InputDriver {
   doubleClick(x: number, y: number): Promise<void>;
   rightClick(x: number, y: number): Promise<void>;
   moveTo(x: number, y: number): Promise<void>;
+  drag(fromX: number, fromY: number, toX: number, toY: number): Promise<void>;
   type(text: string): Promise<void>;
   keyPress(key: string): Promise<void>;
   keyDown(key: string): Promise<void>;
@@ -59,6 +60,10 @@ export async function keyDown(key: string): Promise<void> {
 
 export async function keyUp(key: string): Promise<void> {
   return (await getDriver()).keyUp(key);
+}
+
+export async function drag(fromX: number, fromY: number, toX: number, toY: number): Promise<void> {
+  return (await getDriver()).drag(fromX, fromY, toX, toY);
 }
 
 export async function scroll(x: number, y: number, dy: number): Promise<void> {

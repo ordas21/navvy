@@ -53,6 +53,16 @@ export async function moveTo(x: number, y: number): Promise<void> {
 [WinInput]::SetCursorPos(${Math.round(x)}, ${Math.round(y)})`);
 }
 
+export async function drag(fromX: number, fromY: number, toX: number, toY: number): Promise<void> {
+  await ps(`${MOUSE_SETUP}
+[WinInput]::SetCursorPos(${Math.round(fromX)}, ${Math.round(fromY)})
+[WinInput]::mouse_event([WinInput]::MOUSEEVENTF_LEFTDOWN, 0, 0, 0, [IntPtr]::Zero)
+Start-Sleep -Milliseconds 50
+[WinInput]::SetCursorPos(${Math.round(toX)}, ${Math.round(toY)})
+Start-Sleep -Milliseconds 50
+[WinInput]::mouse_event([WinInput]::MOUSEEVENTF_LEFTUP, 0, 0, 0, [IntPtr]::Zero)`);
+}
+
 // Key mapping from cliclick names to SendKeys tokens
 const KEY_MAP: Record<string, string> = {
   'return': '{ENTER}',

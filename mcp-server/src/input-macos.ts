@@ -42,6 +42,16 @@ export async function keyUp(key: string): Promise<void> {
   await run(`ku:${key}`);
 }
 
+export async function drag(fromX: number, fromY: number, toX: number, toY: number): Promise<void> {
+  await run(
+    `dd:${Math.round(fromX)},${Math.round(fromY)}`,
+    'w:50',
+    `dm:${Math.round(toX)},${Math.round(toY)}`,
+    'w:50',
+    `du:${Math.round(toX)},${Math.round(toY)}`
+  );
+}
+
 /**
  * Scroll using cliclick. Positive dy = scroll down, negative = scroll up.
  */
