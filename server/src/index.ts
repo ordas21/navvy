@@ -4,6 +4,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import multer from 'multer';
 import { v4 as uuidv4 } from 'uuid';
 import path from 'node:path';
+import fs from 'node:fs';
 import os from 'node:os';
 import { ChildProcess } from 'node:child_process';
 import { runClaude } from './claude.js';
@@ -11,6 +12,7 @@ import type { ClientMessage, ServerMessage, Mode } from './types.js';
 
 const PORT = Number(process.env.PORT) || 3300;
 const UPLOAD_DIR = path.join(os.tmpdir(), 'navvy-uploads');
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const app = express();
 app.use(express.json());
@@ -87,11 +89,21 @@ function handlePrompt(ws: WebSocket, msg: ClientMessage): void {
   let prompt = msg.prompt ?? '';
 
   // Attach file context if provided
+  const attachmentPaths: string[] = [];
   if (msg.attachments?.length) {
     const attachmentText = msg.attachments
       .map((a) => {
         if (a.type === 'page_context') {
           return `\n[Current page context]\n${a.data}`;
+        }
+        // Write file data to disk so Claude CLI can read it
+        if (a.data) {
+          const safeName = a.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+          const filePath = path.join(UPLOAD_DIR, `${uuidv4()}-${safeName}`);
+          fs.writeFileSync(filePath, Buffer.from(a.data, 'base64'));
+          attachmentPaths.push(filePath);
+          console.log(`[session ${sessionId}] Saved attachment: ${a.name} → ${filePath}`);
+          return `\n[Attached file: ${a.name} — saved to ${filePath}. Use the Read tool to read this file.]`;
         }
         return `\n[Attached file: ${a.name} (${a.mimeType})]`;
       })
