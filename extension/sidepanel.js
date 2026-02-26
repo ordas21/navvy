@@ -73,6 +73,12 @@ const TOOL_LABELS = {
   browser_console_start: 'Console Start',
   browser_console_get_logs: 'Console Logs',
   browser_console_stop: 'Console Stop',
+  browser_inspect_page: 'Inspect Page',
+  browser_fill_form: 'Fill Form',
+  browser_scroll_to: 'Scroll To',
+  browser_double_click: 'Double Click',
+  browser_right_click: 'Right Click',
+  browser_drag: 'Drag',
 };
 
 function formatToolName(raw) {
@@ -379,6 +385,7 @@ function renderConversation(messages) {
     }
   }
 
+  groupAllSteps();
   scrollToBottom();
 }
 
@@ -590,6 +597,8 @@ function handleServerMessage(msg) {
         appendToConversation(activeConversationId, pendingTurn).catch(console.error);
         pendingTurn = [];
       }
+      // Group completed steps into a collapsible summary
+      groupSteps();
       // Reset streaming elements for next turn
       currentTextEl = null;
       currentThinkingEl = null;
@@ -785,9 +794,7 @@ function addToolResult(toolId, resultText) {
     resultEl.textContent = resultText;
     toolEl.appendChild(resultEl);
 
-    if (resultText && resultText.length > 300) {
-      toolEl.classList.add('collapsed');
-    }
+    // Don't auto-collapse during live streaming — user is watching
   } else {
     const el = document.createElement('div');
     el.className = 'message tool-result-standalone';
@@ -810,6 +817,100 @@ function addErrorMessage(text) {
 
 function scrollToBottom() {
   messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+// ---- Steps Grouping ----
+
+function buildStepsSummary(elements) {
+  const names = [];
+  for (const el of elements) {
+    if (el.classList.contains('tool-call')) {
+      const nameEl = el.querySelector('.tool-name');
+      names.push(nameEl ? nameEl.textContent : 'Tool');
+    } else if (el.classList.contains('thinking')) {
+      names.push('Thinking');
+    }
+  }
+  const count = elements.length;
+  const displayed = names.slice(0, 4).join(', ') + (names.length > 4 ? '...' : '');
+  return `${count} steps \u2014 ${displayed}`;
+}
+
+function wrapInStepsGroup(elements, collapsed = false) {
+  const group = document.createElement('div');
+  group.className = 'steps-group' + (collapsed ? ' collapsed' : '');
+
+  const header = document.createElement('div');
+  header.className = 'steps-group-header';
+
+  const chevron = document.createElement('span');
+  chevron.className = 'steps-chevron';
+  chevron.textContent = '\u25BE';
+  header.appendChild(chevron);
+
+  const summary = document.createElement('span');
+  summary.className = 'steps-summary';
+  summary.textContent = buildStepsSummary(elements);
+  header.appendChild(summary);
+
+  header.onclick = () => group.classList.toggle('collapsed');
+  group.appendChild(header);
+
+  const body = document.createElement('div');
+  body.className = 'steps-group-body';
+  group.appendChild(body);
+
+  // Insert group at the position of the first element
+  elements[0].parentNode.insertBefore(group, elements[0]);
+
+  // Move elements into the body
+  for (const el of elements) {
+    body.appendChild(el);
+  }
+
+  return group;
+}
+
+function groupSteps() {
+  const children = messagesEl.children;
+  const run = [];
+
+  // Scan backward from the end to collect trailing thinking/tool-call elements
+  for (let i = children.length - 1; i >= 0; i--) {
+    const el = children[i];
+    if (el.classList.contains('thinking') || el.classList.contains('tool-call')) {
+      run.unshift(el);
+    } else {
+      break;
+    }
+  }
+
+  if (run.length >= 2) {
+    // Live streaming: keep expanded so user can see what's happening
+    wrapInStepsGroup(run, false);
+  }
+}
+
+function groupAllSteps() {
+  const children = Array.from(messagesEl.children);
+  let run = [];
+
+  for (const el of children) {
+    if (el.classList.contains('thinking') || el.classList.contains('tool-call')) {
+      run.push(el);
+    } else {
+      if (run.length >= 2) {
+        // Restoring old conversation: collapse to save space
+        wrapInStepsGroup(run, true);
+      }
+      run = [];
+    }
+  }
+
+  // Handle trailing run
+  if (run.length >= 2) {
+    wrapInStepsGroup(run, true);
+  }
 }
 
 // ---- Status & Running State ----
