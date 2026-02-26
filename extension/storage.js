@@ -71,7 +71,36 @@ async function saveConversation(id, messages) {
   await chrome.storage.local.set({ [`conv:${id}`]: messages });
 }
 
+// Debounce buffer for batching storage writes
+const _pendingAppends = new Map(); // convId -> { records: [], timer: null }
+
 async function appendToConversation(id, records) {
+  let pending = _pendingAppends.get(id);
+  if (!pending) {
+    pending = { records: [], timer: null };
+    _pendingAppends.set(id, pending);
+  }
+  pending.records.push(...records);
+
+  if (pending.timer) clearTimeout(pending.timer);
+  pending.timer = setTimeout(() => _flushAppend(id), 500);
+}
+
+async function flushAllPendingAppends() {
+  for (const id of _pendingAppends.keys()) {
+    await _flushAppend(id);
+  }
+}
+
+async function _flushAppend(id) {
+  const pending = _pendingAppends.get(id);
+  if (!pending || pending.records.length === 0) return;
+
+  const records = pending.records.splice(0);
+  clearTimeout(pending.timer);
+  pending.timer = null;
+  _pendingAppends.delete(id);
+
   const messages = await loadConversation(id);
   messages.push(...records);
   await saveConversation(id, messages);
@@ -115,19 +144,23 @@ async function deleteConversation(id) {
 
 async function checkStorageUsage() {
   const bytesInUse = await chrome.storage.local.getBytesInUse(null);
-  if (bytesInUse < STORAGE_LIMIT_BYTES) return;
+  if (bytesInUse < STORAGE_LIMIT_BYTES) return 0;
 
   const index = await loadConversationIndex();
-  if (index.length <= 1) return;
+  if (index.length <= 1) return 0;
 
   // Delete oldest conversations until under limit
   const sorted = [...index].sort((a, b) => a.updatedAt - b.updatedAt);
   const activeId = await getActiveConversationId();
+  let deletedCount = 0;
 
   for (const conv of sorted) {
     if (conv.id === activeId) continue;
     await deleteConversation(conv.id);
+    deletedCount++;
     const newBytes = await chrome.storage.local.getBytesInUse(null);
     if (newBytes < STORAGE_LIMIT_BYTES) break;
   }
+
+  return deletedCount;
 }
