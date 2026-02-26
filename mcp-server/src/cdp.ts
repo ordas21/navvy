@@ -3,6 +3,34 @@ import CDP from 'chrome-remote-interface';
 let client: CDP.Client | null = null;
 let currentTargetId: string | null = null;
 
+// ---- Network capture state ----
+interface CapturedRequest {
+  requestId: string;
+  method: string;
+  url: string;
+  type: string;
+  status?: number;
+  statusText?: string;
+  responseHeaders?: Record<string, string>;
+  size: number;
+  timestamp: number;
+}
+
+const capturedRequests = new Map<string, CapturedRequest>();
+let networkListenersAttached = false;
+
+// ---- Console capture state ----
+interface CapturedLog {
+  level: string;
+  text: string;
+  timestamp: number;
+  url?: string;
+  lineNumber?: number;
+}
+
+const capturedLogs: CapturedLog[] = [];
+let consoleListenersAttached = false;
+
 /**
  * Find the best page target — skip extensions, devtools, and internal pages.
  */
@@ -42,6 +70,7 @@ export async function getClient(): Promise<CDP.Client> {
   await client.Page.enable();
   await client.Runtime.enable();
   await client.DOM.enable();
+  await client.Network.enable();
   return client;
 }
 
@@ -80,7 +109,10 @@ export async function getPageInfo(): Promise<{ url: string; title: string }> {
   return { url, title };
 }
 
-export async function getSimplifiedDOM(): Promise<string> {
+export async function getSimplifiedDOM(selector?: string): Promise<string> {
+  const rootExpr = selector
+    ? `document.querySelector(${JSON.stringify(selector)}) || (function() { throw new Error('Selector not found: ${selector}'); })()`
+    : `document.body`;
   return evaluate<string>(`
     (function() {
       function walk(node, depth) {
@@ -134,7 +166,7 @@ export async function getSimplifiedDOM(): Promise<string> {
 
         return result;
       }
-      return walk(document.body, 0);
+      return walk(${rootExpr}, 0);
     })()
   `);
 }
@@ -195,7 +227,12 @@ export async function listTabs(): Promise<Array<{ id: string; title: string; url
   const response = await fetch('http://localhost:9222/json');
   const targets = await response.json() as Array<{ id: string; title: string; url: string; type: string }>;
   return targets
-    .filter(t => t.type === 'page')
+    .filter(t =>
+      t.type === 'page' &&
+      !t.url.startsWith('chrome-extension://') &&
+      !t.url.startsWith('chrome://') &&
+      !t.url.startsWith('devtools://')
+    )
     .map(t => ({ id: t.id, title: t.title, url: t.url }));
 }
 
@@ -207,11 +244,215 @@ export async function switchTab(tabId: string): Promise<void> {
   await client.Page.enable();
   await client.Runtime.enable();
   await client.DOM.enable();
+  await client.Network.enable();
 }
 
 export async function scrollPage(direction: 'up' | 'down', amount: number = 500): Promise<void> {
   const dy = direction === 'down' ? amount : -amount;
   await evaluate(`window.scrollBy(0, ${dy})`);
+}
+
+// ---- Network Capture ----
+
+export async function startNetworkCapture(): Promise<void> {
+  const cdp = await getClient();
+  capturedRequests.clear();
+  if (networkListenersAttached) return;
+  networkListenersAttached = true;
+
+  cdp.on('Network.requestWillBeSent', (params: object) => {
+    const p = params as { requestId: string; request: { method: string; url: string }; type?: string };
+    capturedRequests.set(p.requestId, {
+      requestId: p.requestId,
+      method: p.request.method,
+      url: p.request.url,
+      type: p.type || 'Other',
+      size: 0,
+      timestamp: Date.now(),
+    });
+  });
+
+  cdp.on('Network.responseReceived', (params: object) => {
+    const p = params as { requestId: string; response?: { status?: number; statusText?: string; headers?: Record<string, string> } };
+    const req = capturedRequests.get(p.requestId);
+    if (!req) return;
+    if (p.response) {
+      req.status = p.response.status;
+      req.statusText = p.response.statusText;
+      req.responseHeaders = p.response.headers;
+    }
+  });
+
+  cdp.on('Network.dataReceived', (params: object) => {
+    const p = params as { requestId: string; dataLength?: number };
+    const req = capturedRequests.get(p.requestId);
+    if (req) {
+      req.size += p.dataLength || 0;
+    }
+  });
+}
+
+export function stopNetworkCapture(): void {
+  networkListenersAttached = false;
+  // Note: CDP event listeners persist on the client object;
+  // they become no-ops once we clear state.
+}
+
+export function getNetworkRequests(): CapturedRequest[] {
+  return Array.from(capturedRequests.values());
+}
+
+export async function getNetworkResponseBody(requestId: string): Promise<{ body: string; base64Encoded: boolean }> {
+  const cdp = await getClient();
+  const result = await cdp.Network.getResponseBody({ requestId });
+  return { body: result.body, base64Encoded: result.base64Encoded };
+}
+
+export function clearNetworkCapture(): void {
+  capturedRequests.clear();
+}
+
+// ---- Accessibility Tree ----
+
+export async function getAccessibilityTree(): Promise<string> {
+  const cdp = await getClient();
+  const { nodes } = await cdp.Accessibility.getFullAXTree();
+
+  const lines: string[] = [];
+
+  // Build child map using childIds
+  const childMap = new Map<string, string[]>();
+  for (const node of nodes) {
+    if (node.childIds) {
+      childMap.set(node.nodeId, node.childIds as string[]);
+    }
+  }
+
+  // Build lookup by nodeId
+  const nodeMap = new Map<string, (typeof nodes)[number]>();
+  for (const node of nodes) {
+    nodeMap.set(node.nodeId, node);
+  }
+
+  function walk(nodeId: string, depth: number): void {
+    const node = nodeMap.get(nodeId);
+    if (!node) return;
+
+    const role = node.role?.value as string | undefined;
+    const name = node.name?.value as string | undefined;
+    const value = node.value?.value as string | undefined;
+    const ignored = node.ignored;
+
+    // Skip ignored and generic nodes
+    if (ignored) {
+      // Still walk children of ignored nodes
+      const childIds = childMap.get(nodeId) || [];
+      for (const childId of childIds) {
+        walk(childId, depth);
+      }
+      return;
+    }
+    if (role === 'none' || role === 'generic' || role === 'InlineTextBox') {
+      const childIds = childMap.get(nodeId) || [];
+      for (const childId of childIds) {
+        walk(childId, depth);
+      }
+      return;
+    }
+
+    const indent = '  '.repeat(depth);
+    let line = `${indent}[${role || 'unknown'}]`;
+    if (name) line += ` "${name}"`;
+    if (value) line += ` value="${value}"`;
+
+    // Add states
+    const properties = node.properties as Array<{ name: string; value: { value: unknown } }> | undefined;
+    if (properties) {
+      const states = properties
+        .filter((p) => typeof p.value?.value === 'boolean' && p.value.value === true)
+        .map((p) => p.name);
+      if (states.length > 0) line += ` (${states.join(', ')})`;
+    }
+
+    lines.push(line);
+
+    const childIds = childMap.get(nodeId) || [];
+    for (const childId of childIds) {
+      walk(childId, depth + 1);
+    }
+  }
+
+  // Find root node and walk
+  if (nodes.length > 0) {
+    walk(nodes[0].nodeId, 0);
+  }
+
+  const result = lines.join('\n');
+  const LIMIT = 50000;
+  if (result.length > LIMIT) {
+    return result.substring(0, LIMIT) + '\n\n... (truncated at 50k chars)';
+  }
+  return result;
+}
+
+// ---- Console Capture ----
+
+export async function startConsoleCapture(): Promise<void> {
+  const cdp = await getClient();
+  capturedLogs.length = 0;
+  if (consoleListenersAttached) return;
+  consoleListenersAttached = true;
+
+  cdp.on('Runtime.consoleAPICalled', (params: object) => {
+    const p = params as {
+      type: string;
+      args?: Array<{ value?: unknown; description?: string }>;
+      stackTrace?: { callFrames?: Array<{ url?: string; lineNumber?: number }> };
+    };
+    const text = p.args
+      ? p.args.map((a) => a.value !== undefined ? String(a.value) : (a.description || '')).join(' ')
+      : '';
+    const frame = p.stackTrace?.callFrames?.[0];
+
+    capturedLogs.push({
+      level: p.type,
+      text,
+      timestamp: Date.now(),
+      url: frame?.url,
+      lineNumber: frame?.lineNumber,
+    });
+  });
+
+  cdp.on('Runtime.exceptionThrown', (params: object) => {
+    const p = params as {
+      exceptionDetails?: {
+        text?: string;
+        exception?: { description?: string };
+        url?: string;
+        lineNumber?: number;
+      };
+    };
+
+    capturedLogs.push({
+      level: 'error',
+      text: p.exceptionDetails?.exception?.description || p.exceptionDetails?.text || 'Unknown exception',
+      timestamp: Date.now(),
+      url: p.exceptionDetails?.url,
+      lineNumber: p.exceptionDetails?.lineNumber,
+    });
+  });
+}
+
+export function stopConsoleCapture(): void {
+  consoleListenersAttached = false;
+}
+
+export function getConsoleLogs(): CapturedLog[] {
+  return [...capturedLogs];
+}
+
+export function clearConsoleLogs(): void {
+  capturedLogs.length = 0;
 }
 
 export async function disconnect(): Promise<void> {
