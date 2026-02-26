@@ -1,6 +1,23 @@
 import CDP from 'chrome-remote-interface';
 
 let client: CDP.Client | null = null;
+let currentTargetId: string | null = null;
+
+/**
+ * Find the best page target — skip extensions, devtools, and internal pages.
+ */
+async function findPageTarget(): Promise<string | undefined> {
+  const response = await fetch('http://localhost:9222/json');
+  const targets = await response.json() as Array<{ id: string; title: string; url: string; type: string }>;
+  const page = targets.find(
+    (t) =>
+      t.type === 'page' &&
+      !t.url.startsWith('chrome-extension://') &&
+      !t.url.startsWith('chrome://') &&
+      !t.url.startsWith('devtools://'),
+  );
+  return page?.id;
+}
 
 export async function getClient(): Promise<CDP.Client> {
   if (client) {
@@ -10,9 +27,17 @@ export async function getClient(): Promise<CDP.Client> {
       return client;
     } catch {
       client = null;
+      currentTargetId = null;
     }
   }
-  client = await CDP({ port: 9222 });
+
+  const targetId = await findPageTarget();
+  if (!targetId) {
+    throw new Error('No browser tab found. Open a page in Chrome first.');
+  }
+
+  client = await CDP({ port: 9222, target: targetId });
+  currentTargetId = targetId;
   // Enable required domains
   await client.Page.enable();
   await client.Runtime.enable();

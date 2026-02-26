@@ -16,12 +16,35 @@ export interface Attachment {
 }
 
 export interface ServerMessage {
-  type: 'assistant_text' | 'tool_use' | 'tool_result' | 'done' | 'error' | 'status' | 'pong';
+  type:
+    | 'text_delta'
+    | 'thinking_delta'
+    | 'tool_use_start'
+    | 'tool_use_input_delta'
+    | 'tool_use_done'
+    | 'tool_result'
+    | 'turn_complete'
+    | 'done'
+    | 'error'
+    | 'status'
+    | 'cost'
+    | 'pong';
   sessionId: string;
   text?: string;
+  thinking?: string;
   toolName?: string;
-  toolInput?: Record<string, unknown>;
+  toolId?: string;
+  toolInput?: string;
   toolResult?: string;
   error?: string;
   status?: string;
+  cost?: CostInfo;
+}
+
+export interface CostInfo {
+  totalCostUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+  numTurns: number;
+  durationMs: number;
 }

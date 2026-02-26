@@ -1,7 +1,13 @@
 {
-  "name": "claude-browser-agent",
+  "name": "navvy",
   "version": "1.0.0",
+  "description": "AI-powered browser automation via a Chrome extension, WebSocket server, and MCP tools",
   "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ordas21/navvy.git"
+  },
   "workspaces": [
     "server",
     "mcp-server"

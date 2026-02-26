@@ -10,7 +10,7 @@ import { runClaude } from './claude.js';
 import type { ClientMessage, ServerMessage } from './types.js';
 
 const PORT = Number(process.env.PORT) || 3300;
-const UPLOAD_DIR = path.join(os.tmpdir(), 'claude-browser-agent-uploads');
+const UPLOAD_DIR = path.join(os.tmpdir(), 'navvy-uploads');
 
 const app = express();
 app.use(express.json());
@@ -98,26 +98,15 @@ function handlePrompt(ws: WebSocket, msg: ClientMessage): void {
     prompt += attachmentText;
   }
 
-  sendMessage(ws, { type: 'status', sessionId, status: 'thinking' });
+  console.log(`[session ${sessionId}] Prompt: ${prompt.substring(0, 100)}...`);
+  sendMessage(ws, { type: 'status', sessionId, status: 'Starting...' });
 
-  const proc = runClaude(prompt, {
-    onText: (text) => {
-      sendMessage(ws, { type: 'assistant_text', sessionId, text });
-    },
-    onToolUse: (toolName, toolInput) => {
-      sendMessage(ws, { type: 'tool_use', sessionId, toolName, toolInput });
-    },
-    onToolResult: (text) => {
-      sendMessage(ws, { type: 'tool_result', sessionId, toolResult: text });
-    },
-    onDone: (_fullText) => {
-      sendMessage(ws, { type: 'done', sessionId });
+  const proc = runClaude(prompt, (partialMsg) => {
+    sendMessage(ws, { ...partialMsg, sessionId });
+
+    if (partialMsg.type === 'done') {
       activeSessions.delete(sessionId);
-    },
-    onError: (error) => {
-      sendMessage(ws, { type: 'error', sessionId, error });
-      activeSessions.delete(sessionId);
-    },
+    }
   });
 
   activeSessions.set(sessionId, proc);
@@ -134,11 +123,14 @@ function handleCancel(sessionId: string): void {
 
 function sendMessage(ws: WebSocket, msg: ServerMessage): void {
   if (ws.readyState === WebSocket.OPEN) {
+    if (msg.type !== 'pong' && msg.type !== 'text_delta' && msg.type !== 'thinking_delta' && msg.type !== 'tool_use_input_delta') {
+      console.log(`[ws:send] ${msg.type}${msg.status ? ': ' + msg.status : ''}${msg.toolName ? ': ' + msg.toolName : ''}`);
+    }
     ws.send(JSON.stringify(msg));
   }
 }
 
 httpServer.listen(PORT, () => {
-  console.log(`Claude Browser Agent server running on http://localhost:${PORT}`);
+  console.log(`Navvy server running on http://localhost:${PORT}`);
   console.log(`WebSocket endpoint: ws://localhost:${PORT}/ws`);
 });

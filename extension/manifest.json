@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Claude Browser Agent",
+  "name": "Navvy",
   "version": "1.0.0",
-  "description": "AI-powered browser automation agent using Claude",
+  "description": "AI-powered browser automation agent",
   "permissions": [
     "sidePanel",
     "activeTab",
@@ -16,7 +16,7 @@
     "service_worker": "background.js"
   },
   "action": {
-    "default_title": "Claude Browser Agent"
+    "default_title": "Navvy"
   },
   "icons": {
     "16": "icons/icon16.png",

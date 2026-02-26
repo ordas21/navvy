@@ -1,57 +1,66 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { platform } from 'node:os';
 
-const execFileAsync = promisify(execFile);
+interface InputDriver {
+  click(x: number, y: number): Promise<void>;
+  doubleClick(x: number, y: number): Promise<void>;
+  rightClick(x: number, y: number): Promise<void>;
+  moveTo(x: number, y: number): Promise<void>;
+  type(text: string): Promise<void>;
+  keyPress(key: string): Promise<void>;
+  keyDown(key: string): Promise<void>;
+  keyUp(key: string): Promise<void>;
+  scroll(x: number, y: number, dy: number): Promise<void>;
+}
 
-const CLICLICK = 'cliclick';
+let driver: InputDriver | null = null;
 
-async function run(...args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync(CLICLICK, args);
-  return stdout.trim();
+async function getDriver(): Promise<InputDriver> {
+  if (driver) return driver;
+
+  const os = platform();
+  if (os === 'win32') {
+    driver = await import('./input-windows.js');
+  } else if (os === 'darwin') {
+    driver = await import('./input-macos.js');
+  } else {
+    throw new Error(`Unsupported platform: ${os}. Only macOS and Windows are supported.`);
+  }
+
+  return driver;
 }
 
 export async function click(x: number, y: number): Promise<void> {
-  await run(`c:${Math.round(x)},${Math.round(y)}`);
+  (await getDriver()).click(x, y);
 }
 
 export async function doubleClick(x: number, y: number): Promise<void> {
-  await run(`dc:${Math.round(x)},${Math.round(y)}`);
+  (await getDriver()).doubleClick(x, y);
 }
 
 export async function rightClick(x: number, y: number): Promise<void> {
-  await run(`rc:${Math.round(x)},${Math.round(y)}`);
+  (await getDriver()).rightClick(x, y);
 }
 
 export async function moveTo(x: number, y: number): Promise<void> {
-  await run(`m:${Math.round(x)},${Math.round(y)}`);
+  (await getDriver()).moveTo(x, y);
 }
 
 export async function type(text: string): Promise<void> {
-  await run(`t:${text}`);
+  (await getDriver()).type(text);
 }
 
 export async function keyPress(key: string): Promise<void> {
-  await run(`kp:${key}`);
+  (await getDriver()).keyPress(key);
 }
 
 export async function keyDown(key: string): Promise<void> {
-  await run(`kd:${key}`);
+  (await getDriver()).keyDown(key);
 }
 
 export async function keyUp(key: string): Promise<void> {
-  await run(`ku:${key}`);
+  (await getDriver()).keyUp(key);
 }
 
-/**
- * Scroll using cliclick. Positive dy = scroll down, negative = scroll up.
- */
 export async function scroll(x: number, y: number, dy: number): Promise<void> {
-  // Move to position first, then use key presses for scrolling
-  // cliclick doesn't have native scroll, so we'll use the CDP approach as fallback
-  await moveTo(x, y);
-  const direction = dy > 0 ? 'arrow-down' : 'arrow-up';
-  const steps = Math.abs(Math.round(dy / 3));
-  for (let i = 0; i < steps; i++) {
-    await keyPress(direction);
-  }
+  (await getDriver()).scroll(x, y, dy);
 }
