@@ -111,12 +111,17 @@ export function registerTools(server: McpServer): void {
 
   server.tool(
     'browser_scroll',
-    'Scroll the page up or down.',
+    'Scroll the page or a scrollable container up or down. If selector is provided, scrolls that container instead of the page.',
     {
       direction: z.enum(['up', 'down']).describe('Scroll direction'),
       amount: z.number().optional().describe('Scroll amount in pixels (default 500)'),
+      selector: z.string().optional().describe('Optional CSS selector of a scrollable container. If omitted, scrolls the page.'),
     },
-    async ({ direction, amount }) => {
+    async ({ direction, amount, selector }) => {
+      if (selector) {
+        const result = await cdp.scrollInContainer(selector, direction, amount ?? 500);
+        return { content: [{ type: 'text', text: `Scrolled container "${selector}" ${direction} by ${amount ?? 500}px (scrollTop: ${Math.round(result.scrollTop)}/${result.scrollHeight - result.clientHeight})` }] };
+      }
       await cdp.scrollPage(direction, amount ?? 500);
       return { content: [{ type: 'text', text: `Scrolled ${direction} by ${amount ?? 500}px` }] };
     }
@@ -360,6 +365,153 @@ export function registerTools(server: McpServer): void {
       cdp.stopConsoleCapture();
       cdp.clearConsoleLogs();
       return { content: [{ type: 'text', text: 'Console capture stopped and cleared.' }] };
+    }
+  );
+
+  // ---- Efficiency tools ----
+
+  server.tool(
+    'browser_inspect_page',
+    'Get a structured overview of all interactive elements on the page with ready-to-use CSS selectors. Much more efficient than browser_get_dom for understanding what you can interact with. Returns elements with their types, labels, values, options, and states.',
+    {},
+    async () => {
+      const inspection = await cdp.inspectPage();
+
+      const lines: string[] = [];
+      const scrollPct = inspection.scrollHeight <= inspection.viewportHeight
+        ? 'no scroll'
+        : `${Math.round((inspection.scrollTop / (inspection.scrollHeight - inspection.viewportHeight)) * 100)}%`;
+      lines.push(`Page: ${inspection.title} | ${inspection.url}`);
+      lines.push(`Viewport: ${inspection.viewportWidth}x${inspection.viewportHeight} | Scroll: ${Math.round(inspection.scrollTop)}/${inspection.scrollHeight} (${scrollPct})`);
+      if (inspection.hasDialog) lines.push('⚠ Dialog detected');
+      if (inspection.focusedSelector) lines.push(`Focused: ${inspection.focusedSelector}`);
+      lines.push('');
+
+      lines.push(`## Interactive Elements (${inspection.elements.length})`);
+      for (const el of inspection.elements) {
+        let line = `[${el.index}] ${el.tag}`;
+        if (el.type) line += `[type=${el.type}]`;
+        line += ` ${el.selector}`;
+        if (el.label) line += ` | label: "${el.label}"`;
+        if (el.text) line += ` | text: "${el.text}"`;
+        if (el.value !== undefined) line += ` | value: "${el.value}"`;
+        if (el.placeholder) line += ` | placeholder: "${el.placeholder}"`;
+        if (el.options) line += ` | options: ${JSON.stringify(el.options)}`;
+        if (el.checked !== undefined) line += ` | checked: ${el.checked}`;
+        if (el.disabled) line += ' | DISABLED';
+        if (el.draggable) line += ' | draggable';
+        if (!el.inViewport) line += ' | OFF-SCREEN';
+        lines.push(line);
+      }
+
+      if (inspection.forms.length > 0) {
+        lines.push('');
+        lines.push(`## Forms (${inspection.forms.length})`);
+        for (const form of inspection.forms) {
+          let line = form.selector;
+          if (form.action) line += ` action="${form.action}"`;
+          if (form.method) line += ` method="${form.method}"`;
+          line += ` | contains elements [${form.elementIndices.join(', ')}]`;
+          lines.push(line);
+        }
+      }
+
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+  );
+
+  server.tool(
+    'browser_fill_form',
+    'Batch-fill multiple form fields in a single call. Much more efficient than clicking and typing each field individually. Supports text inputs, textareas, selects, checkboxes, radios, and contenteditable elements. Works with React/Vue/Angular.',
+    {
+      actions: z.array(z.object({
+        selector: z.string().describe('CSS selector of the form field'),
+        value: z.string().optional().describe('Value to set (for text inputs, textareas, selects)'),
+        selectText: z.string().optional().describe('For selects: visible text of the option to select'),
+        check: z.boolean().optional().describe('For checkboxes/radios: whether to check (true) or uncheck (false)'),
+        clear: z.boolean().optional().describe('Clear the field before setting value'),
+      })).describe('Array of form fill actions'),
+    },
+    async ({ actions }) => {
+      const result = await cdp.fillForm(actions);
+      const lines = [`Filled ${result.succeeded}/${result.total} fields`];
+      for (const r of result.results) {
+        if (r.ok) {
+          lines.push(`OK: ${r.selector} — "${r.previousValue}" → "${r.newValue}"`);
+        } else {
+          lines.push(`FAIL: ${r.selector} — ${r.error}`);
+        }
+      }
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+  );
+
+  server.tool(
+    'browser_scroll_to',
+    'Scroll an element into view. More precise than browser_scroll for targeting specific elements.',
+    {
+      selector: z.string().describe('CSS selector of the element to scroll into view'),
+      block: z.enum(['start', 'center', 'end', 'nearest']).optional().describe('Vertical alignment (default: center)'),
+    },
+    async ({ selector, block }) => {
+      const result = await cdp.scrollToElement(selector, block);
+      return { content: [{ type: 'text', text: result.inViewport ? `Scrolled "${selector}" into view` : `Scrolled toward "${selector}" but it may not be fully in viewport` }] };
+    }
+  );
+
+  server.tool(
+    'browser_double_click',
+    'Double-click an element on the page using a CSS selector.',
+    { selector: z.string().describe('CSS selector of the element to double-click') },
+    async ({ selector }) => {
+      const coords = await elementToScreenCoords(selector);
+      await input.doubleClick(coords.x, coords.y);
+      await new Promise(r => setTimeout(r, 300));
+      return { content: [{ type: 'text', text: `Double-clicked "${selector}" at (${coords.x}, ${coords.y})` }] };
+    }
+  );
+
+  server.tool(
+    'browser_right_click',
+    'Right-click (context menu) an element on the page using a CSS selector.',
+    { selector: z.string().describe('CSS selector of the element to right-click') },
+    async ({ selector }) => {
+      const coords = await elementToScreenCoords(selector);
+      await input.rightClick(coords.x, coords.y);
+      await new Promise(r => setTimeout(r, 300));
+      return { content: [{ type: 'text', text: `Right-clicked "${selector}" at (${coords.x}, ${coords.y})` }] };
+    }
+  );
+
+  server.tool(
+    'browser_drag',
+    'Drag from one element to another using native OS mouse input. Optionally dispatch HTML5 Drag and Drop API events for web apps that use the HTML5 drag API.',
+    {
+      from: z.string().describe('CSS selector of the drag source element'),
+      to: z.string().describe('CSS selector of the drop target element'),
+      html5: z.boolean().optional().describe('Also dispatch HTML5 DragEvent sequence (dragstart → dragover → drop → dragend). Use for apps that use the HTML5 Drag and Drop API.'),
+    },
+    async ({ from, to, html5 }) => {
+      const fromCoords = await elementToScreenCoords(from);
+      const toCoords = await elementToScreenCoords(to);
+      await input.drag(fromCoords.x, fromCoords.y, toCoords.x, toCoords.y);
+
+      if (html5) {
+        await cdp.evaluate(`
+          (function() {
+            var src = document.querySelector(${JSON.stringify(from)});
+            var dst = document.querySelector(${JSON.stringify(to)});
+            if (!src || !dst) throw new Error('Drag source or target not found');
+            var dataTransfer = new DataTransfer();
+            src.dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer: dataTransfer }));
+            dst.dispatchEvent(new DragEvent('dragover', { bubbles: true, dataTransfer: dataTransfer }));
+            dst.dispatchEvent(new DragEvent('drop', { bubbles: true, dataTransfer: dataTransfer }));
+            src.dispatchEvent(new DragEvent('dragend', { bubbles: true, dataTransfer: dataTransfer }));
+          })()
+        `);
+      }
+
+      return { content: [{ type: 'text', text: `Dragged "${from}" → "${to}"${html5 ? ' (with HTML5 DragEvent)' : ''}` }] };
     }
   );
 }
