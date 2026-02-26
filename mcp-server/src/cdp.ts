@@ -455,6 +455,336 @@ export function clearConsoleLogs(): void {
   capturedLogs.length = 0;
 }
 
+// ---- Page Inspection ----
+
+export interface InspectedElement {
+  index: number;
+  tag: string;
+  type?: string;
+  selector: string;
+  label?: string;
+  text?: string;
+  value?: string;
+  placeholder?: string;
+  options?: string[];
+  checked?: boolean;
+  disabled?: boolean;
+  draggable?: boolean;
+  inViewport: boolean;
+  role?: string;
+  name?: string;
+}
+
+export interface PageInspection {
+  url: string;
+  title: string;
+  viewportWidth: number;
+  viewportHeight: number;
+  scrollTop: number;
+  scrollHeight: number;
+  focusedSelector?: string;
+  hasDialog: boolean;
+  elements: InspectedElement[];
+  forms: Array<{ selector: string; action?: string; method?: string; elementIndices: number[] }>;
+}
+
+export async function inspectPage(): Promise<PageInspection> {
+  return evaluate<PageInspection>(`
+    (function() {
+      var vw = window.innerWidth, vh = window.innerHeight;
+
+      function bestSelector(el) {
+        if (el.id) return '#' + CSS.escape(el.id);
+        var testid = el.getAttribute('data-testid');
+        if (testid) return '[data-testid="' + testid + '"]';
+        var name = el.getAttribute('name');
+        var tag = el.tagName.toLowerCase();
+        if (name) {
+          var type = el.getAttribute('type');
+          if (type) return tag + '[name="' + name + '"][type="' + type + '"]';
+          return tag + '[name="' + name + '"]';
+        }
+        var ariaLabel = el.getAttribute('aria-label');
+        if (ariaLabel) return tag + '[aria-label="' + ariaLabel + '"]';
+        var role = el.getAttribute('role');
+        if (role) {
+          var text = (el.textContent || '').trim().substring(0, 30);
+          if (text) return tag + '[role="' + role + '"]';
+        }
+        // Build a positional selector
+        var path = [];
+        var current = el;
+        while (current && current !== document.body && path.length < 4) {
+          var seg = current.tagName.toLowerCase();
+          if (current.id) { path.unshift('#' + CSS.escape(current.id)); break; }
+          var parent = current.parentElement;
+          if (parent) {
+            var siblings = Array.from(parent.children).filter(function(c) { return c.tagName === current.tagName; });
+            if (siblings.length > 1) {
+              seg += ':nth-of-type(' + (siblings.indexOf(current) + 1) + ')';
+            }
+          }
+          path.unshift(seg);
+          current = parent;
+        }
+        return path.join(' > ');
+      }
+
+      function getLabel(el) {
+        if (el.id) {
+          var lbl = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+          if (lbl) return lbl.textContent.trim().substring(0, 80);
+        }
+        var parent = el.closest('label');
+        if (parent) return parent.textContent.trim().substring(0, 80);
+        var ariaLabel = el.getAttribute('aria-label');
+        if (ariaLabel) return ariaLabel;
+        var ariaLabelledBy = el.getAttribute('aria-labelledby');
+        if (ariaLabelledBy) {
+          var refEl = document.getElementById(ariaLabelledBy);
+          if (refEl) return refEl.textContent.trim().substring(0, 80);
+        }
+        return undefined;
+      }
+
+      var selectors = 'input, select, textarea, button, a[href], [role="button"], [role="link"], [role="tab"], [role="menuitem"], [role="checkbox"], [role="radio"], [role="switch"], [draggable="true"], [contenteditable="true"]';
+      var allEls = Array.from(document.querySelectorAll(selectors));
+      // Filter hidden
+      allEls = allEls.filter(function(el) {
+        if (el.type === 'hidden') return false;
+        var style = window.getComputedStyle(el);
+        return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+      });
+      // Cap at 100
+      allEls = allEls.slice(0, 100);
+
+      var elements = allEls.map(function(el, i) {
+        var tag = el.tagName.toLowerCase();
+        var rect = el.getBoundingClientRect();
+        var inViewport = rect.top < vh && rect.bottom > 0 && rect.left < vw && rect.right > 0;
+        var item = {
+          index: i,
+          tag: tag,
+          selector: bestSelector(el),
+          inViewport: inViewport
+        };
+        var type = el.getAttribute('type');
+        if (type) item.type = type;
+        var label = getLabel(el);
+        if (label) item.label = label;
+        var role = el.getAttribute('role');
+        if (role) item.role = role;
+        var elName = el.getAttribute('name');
+        if (elName) item.name = elName;
+        // Text content for buttons/links
+        if (tag === 'button' || tag === 'a' || role === 'button' || role === 'link' || role === 'tab' || role === 'menuitem') {
+          var text = (el.textContent || '').trim().substring(0, 80);
+          if (text) item.text = text;
+        }
+        // Value for inputs/selects/textareas
+        if (tag === 'input' || tag === 'textarea' || tag === 'select') {
+          item.value = el.value || '';
+        }
+        if (el.placeholder) item.placeholder = el.placeholder;
+        // Options for selects
+        if (tag === 'select') {
+          item.options = Array.from(el.options).map(function(o) { return o.textContent.trim(); });
+        }
+        // Checked state
+        if (type === 'checkbox' || type === 'radio') {
+          item.checked = el.checked;
+        }
+        if (el.disabled) item.disabled = true;
+        if (el.draggable || el.getAttribute('draggable') === 'true') item.draggable = true;
+        return item;
+      });
+
+      // Forms
+      var formEls = Array.from(document.querySelectorAll('form'));
+      var forms = formEls.map(function(form) {
+        var sel = bestSelector(form);
+        var indices = [];
+        elements.forEach(function(elem, idx) {
+          var domEl = document.querySelector(elem.selector);
+          if (domEl && form.contains(domEl)) indices.push(idx);
+        });
+        return {
+          selector: sel,
+          action: form.getAttribute('action') || undefined,
+          method: (form.getAttribute('method') || '').toUpperCase() || undefined,
+          elementIndices: indices
+        };
+      });
+
+      // Focused element
+      var focusedSelector = undefined;
+      if (document.activeElement && document.activeElement !== document.body) {
+        try { focusedSelector = bestSelector(document.activeElement); } catch(e) {}
+      }
+
+      return {
+        url: window.location.href,
+        title: document.title,
+        viewportWidth: vw,
+        viewportHeight: vh,
+        scrollTop: window.scrollY,
+        scrollHeight: document.documentElement.scrollHeight,
+        focusedSelector: focusedSelector,
+        hasDialog: !!document.querySelector('dialog[open], [role="dialog"], [role="alertdialog"]'),
+        elements: elements,
+        forms: forms
+      };
+    })()
+  `);
+}
+
+// ---- Batch Form Filling ----
+
+export interface FormFillAction {
+  selector: string;
+  value?: string;
+  selectText?: string;
+  check?: boolean;
+  clear?: boolean;
+}
+
+export interface FormFillFieldResult {
+  selector: string;
+  ok: boolean;
+  error?: string;
+  previousValue?: string;
+  newValue?: string;
+}
+
+export interface FormFillResult {
+  total: number;
+  succeeded: number;
+  results: FormFillFieldResult[];
+}
+
+export async function fillForm(actions: FormFillAction[]): Promise<FormFillResult> {
+  return evaluate<FormFillResult>(`
+    (function() {
+      var actions = ${JSON.stringify(actions)};
+      var results = [];
+      var succeeded = 0;
+
+      for (var i = 0; i < actions.length; i++) {
+        var action = actions[i];
+        var result = { selector: action.selector, ok: false };
+        try {
+          var el = document.querySelector(action.selector);
+          if (!el) throw new Error('Element not found');
+          var tag = el.tagName.toLowerCase();
+          var type = (el.getAttribute('type') || '').toLowerCase();
+
+          // Handle checkboxes and radios
+          if (type === 'checkbox' || type === 'radio') {
+            var shouldBeChecked = action.check !== undefined ? action.check : true;
+            result.previousValue = String(el.checked);
+            if (el.checked !== shouldBeChecked) {
+              el.click();
+            }
+            result.newValue = String(el.checked);
+            result.ok = true;
+            succeeded++;
+            results.push(result);
+            continue;
+          }
+
+          // Handle select elements
+          if (tag === 'select') {
+            result.previousValue = el.value;
+            var options = Array.from(el.options);
+            var opt = null;
+            if (action.selectText) {
+              opt = options.find(function(o) { return o.textContent.trim() === action.selectText; });
+            }
+            if (!opt && action.value !== undefined) {
+              opt = options.find(function(o) { return o.value === action.value; });
+              if (!opt) opt = options.find(function(o) { return o.textContent.trim() === action.value; });
+            }
+            if (!opt) throw new Error('Option not found: ' + (action.selectText || action.value));
+            el.value = opt.value;
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            result.newValue = opt.textContent.trim();
+            result.ok = true;
+            succeeded++;
+            results.push(result);
+            continue;
+          }
+
+          // Handle contenteditable
+          if (el.getAttribute('contenteditable') === 'true') {
+            result.previousValue = el.textContent;
+            if (action.clear) el.textContent = '';
+            if (action.value !== undefined) el.textContent = action.value;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            result.newValue = el.textContent;
+            result.ok = true;
+            succeeded++;
+            results.push(result);
+            continue;
+          }
+
+          // Handle text inputs and textareas (React/Vue/Angular compatible)
+          result.previousValue = el.value;
+          if (action.clear || action.value !== undefined) {
+            var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+              tag === 'textarea' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype,
+              'value'
+            );
+            if (nativeInputValueSetter && nativeInputValueSetter.set) {
+              nativeInputValueSetter.set.call(el, action.clear && !action.value ? '' : (action.value || ''));
+            } else {
+              el.value = action.clear && !action.value ? '' : (action.value || '');
+            }
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+          result.newValue = el.value;
+          result.ok = true;
+          succeeded++;
+        } catch (e) {
+          result.error = e.message || String(e);
+        }
+        results.push(result);
+      }
+
+      return { total: actions.length, succeeded: succeeded, results: results };
+    })()
+  `);
+}
+
+// ---- Scroll To Element ----
+
+export async function scrollToElement(selector: string, block?: string): Promise<{ inViewport: boolean }> {
+  return evaluate<{ inViewport: boolean }>(`
+    (function() {
+      var el = document.querySelector(${JSON.stringify(selector)});
+      if (!el) throw new Error('Element not found: ${selector}');
+      el.scrollIntoView({ behavior: 'instant', block: ${block ? JSON.stringify(block) : "'center'"} });
+      var rect = el.getBoundingClientRect();
+      var inViewport = rect.top >= 0 && rect.bottom <= window.innerHeight && rect.left >= 0 && rect.right <= window.innerWidth;
+      return { inViewport: inViewport };
+    })()
+  `);
+}
+
+// ---- Scroll In Container ----
+
+export async function scrollInContainer(containerSelector: string, direction: 'up' | 'down', amount: number): Promise<{ scrollTop: number; scrollHeight: number; clientHeight: number }> {
+  const dy = direction === 'down' ? amount : -amount;
+  return evaluate<{ scrollTop: number; scrollHeight: number; clientHeight: number }>(`
+    (function() {
+      var el = document.querySelector(${JSON.stringify(containerSelector)});
+      if (!el) throw new Error('Container not found: ${containerSelector}');
+      el.scrollBy(0, ${dy});
+      return { scrollTop: el.scrollTop, scrollHeight: el.scrollHeight, clientHeight: el.clientHeight };
+    })()
+  `);
+}
+
 export async function disconnect(): Promise<void> {
   if (client) {
     await client.close();
