@@ -1,6 +1,7 @@
 /* global chrome, loadConversationIndex, loadConversation, appendToConversation,
    createConversation, deleteConversation, updateConversationIndex,
-   getActiveConversationId, setActiveConversationId, checkStorageUsage */
+   getActiveConversationId, setActiveConversationId, checkStorageUsage,
+   flushAllPendingAppends */
 
 const DEFAULT_SERVER_URL = 'ws://localhost:3300/ws';
 
@@ -11,6 +12,7 @@ let activeConversationId = null;
 let isRunning = false;
 let attachments = [];
 let serverUrl = DEFAULT_SERVER_URL;
+let currentMode = 'auto';
 
 // Current streaming elements
 let currentTextEl = null;
@@ -38,11 +40,169 @@ const settingsOverlay = document.getElementById('settings-overlay');
 const btnSettingsSave = document.getElementById('btn-settings-save');
 const btnSettingsCancel = document.getElementById('btn-settings-cancel');
 const settingServerUrl = document.getElementById('setting-server-url');
+const btnSettings = document.getElementById('btn-settings');
 const btnConversations = document.getElementById('btn-conversations');
 const conversationsOverlay = document.getElementById('conversations-overlay');
 const conversationsList = document.getElementById('conversations-list');
 const btnNewConversation = document.getElementById('btn-new-conversation');
 const btnConversationsClose = document.getElementById('btn-conversations-close');
+
+// ---- Tool Labels ----
+const TOOL_LABELS = {
+  browser_screenshot: 'Screenshot',
+  browser_get_dom: 'Get DOM',
+  browser_click: 'Click',
+  browser_click_at: 'Click at Coords',
+  browser_type: 'Type',
+  browser_key_press: 'Key Press',
+  browser_navigate: 'Navigate',
+  browser_scroll: 'Scroll',
+  browser_evaluate: 'Run JavaScript',
+  browser_get_url: 'Get URL',
+  browser_wait: 'Wait',
+  browser_tabs: 'List Tabs',
+  browser_switch_tab: 'Switch Tab',
+  browser_hover: 'Hover',
+  browser_select: 'Select Option',
+  browser_clear_input: 'Clear Input',
+  browser_network_start: 'Network Start',
+  browser_network_get_requests: 'Network Requests',
+  browser_network_get_response: 'Network Response',
+  browser_network_stop: 'Network Stop',
+  browser_get_accessibility_tree: 'Accessibility Tree',
+  browser_console_start: 'Console Start',
+  browser_console_get_logs: 'Console Logs',
+  browser_console_stop: 'Console Stop',
+};
+
+function formatToolName(raw) {
+  return TOOL_LABELS[raw] || raw.replace(/^browser_/, '').replace(/_/g, ' ');
+}
+
+// ---- Mode Management ----
+
+function setMode(mode) {
+  currentMode = mode;
+  document.querySelectorAll('.mode-chip').forEach((chip) => {
+    chip.classList.toggle('active', chip.dataset.mode === mode);
+  });
+  chrome.storage.local.set({ currentMode: mode });
+}
+
+// ---- Slash Commands ----
+
+const SLASH_COMMANDS = [
+  { command: '/mode', description: 'Switch mode or show current (e.g. /mode network)' },
+  { command: '/screenshot', description: 'Take a screenshot of the current page' },
+  { command: '/dom', description: 'Get the DOM tree of the current page' },
+  { command: '/url', description: 'Show current tab URL' },
+  { command: '/clear', description: 'Start a new conversation' },
+  { command: '/help', description: 'Show available commands' },
+];
+
+function parseSlashCommand(text) {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('/')) return null;
+  const spaceIndex = trimmed.indexOf(' ');
+  if (spaceIndex === -1) {
+    return { command: trimmed.toLowerCase(), arg: '' };
+  }
+  return {
+    command: trimmed.substring(0, spaceIndex).toLowerCase(),
+    arg: trimmed.substring(spaceIndex + 1).trim(),
+  };
+}
+
+function addSystemMessage(text) {
+  const el = document.createElement('div');
+  el.className = 'message system-msg';
+  el.textContent = text;
+  messagesEl.appendChild(el);
+  scrollToBottom();
+  return el;
+}
+
+async function handleSlashCommand(parsed) {
+  switch (parsed.command) {
+    case '/mode': {
+      const validModes = ['auto', 'screenshot', 'dom', 'accessibility', 'network', 'console'];
+      if (parsed.arg && validModes.includes(parsed.arg.toLowerCase())) {
+        setMode(parsed.arg.toLowerCase());
+        addSystemMessage(`Mode switched to: ${parsed.arg.toLowerCase()}`);
+      } else if (parsed.arg) {
+        addSystemMessage(`Unknown mode: "${parsed.arg}". Valid modes: ${validModes.join(', ')}`);
+      } else {
+        addSystemMessage(`Current mode: ${currentMode}\nValid modes: ${validModes.join(', ')}`);
+      }
+      return true;
+    }
+    case '/screenshot':
+      promptInput.value = 'Take a screenshot of the current page';
+      sendPrompt();
+      return true;
+    case '/dom':
+      promptInput.value = 'Get the DOM tree of the current page';
+      sendPrompt();
+      return true;
+    case '/url': {
+      try {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (tab) {
+          addSystemMessage(`URL: ${tab.url}\nTitle: ${tab.title}`);
+        } else {
+          addSystemMessage('No active tab found');
+        }
+      } catch {
+        addSystemMessage('Unable to get tab info');
+      }
+      return true;
+    }
+    case '/clear':
+      await startNewConversation();
+      return true;
+    case '/help': {
+      const lines = SLASH_COMMANDS.map((c) => `${c.command}  ${c.description}`);
+      addSystemMessage('Available commands:\n' + lines.join('\n'));
+      return true;
+    }
+    default:
+      addSystemMessage(`Unknown command: ${parsed.command}. Type /help for available commands.`);
+      return true;
+  }
+}
+
+// ---- Slash Popup ----
+
+const slashPopup = document.getElementById('slash-popup');
+const slashPopupList = document.getElementById('slash-popup-list');
+
+function showSlashPopup(filter) {
+  const matches = SLASH_COMMANDS.filter((c) =>
+    c.command.startsWith(filter.toLowerCase())
+  );
+  if (matches.length === 0) {
+    hideSlashPopup();
+    return;
+  }
+  slashPopupList.innerHTML = '';
+  for (const cmd of matches) {
+    const item = document.createElement('div');
+    item.className = 'slash-item';
+    item.innerHTML = `<span class="slash-cmd">${cmd.command}</span><span class="slash-desc">${cmd.description}</span>`;
+    item.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      promptInput.value = cmd.command + ' ';
+      promptInput.focus();
+      hideSlashPopup();
+    });
+    slashPopupList.appendChild(item);
+  }
+  slashPopup.style.display = 'block';
+}
+
+function hideSlashPopup() {
+  slashPopup.style.display = 'none';
+}
 
 // ---- Render Functions (reusable for both streaming and restore) ----
 
@@ -99,7 +259,7 @@ function renderToolCallMessage(toolName, toolId, input, result) {
 
   const name = document.createElement('span');
   name.className = 'tool-name';
-  name.textContent = toolName;
+  name.textContent = formatToolName(toolName);
   header.appendChild(name);
 
   if (result !== undefined) {
@@ -153,15 +313,26 @@ function renderCostMessage(cost) {
     ? `$${cost.totalCostUsd.toFixed(4)}`
     : `$${cost.totalCostUsd.toFixed(2)}`;
 
-  el.innerHTML = `
-    <span class="cost-item">${costStr}</span>
-    <span class="cost-sep">\u00B7</span>
-    <span class="cost-item">${cost.numTurns} turns</span>
-    <span class="cost-sep">\u00B7</span>
-    <span class="cost-item">${duration}s</span>
-    <span class="cost-sep">\u00B7</span>
-    <span class="cost-item">${(cost.inputTokens + cost.outputTokens).toLocaleString()} tokens</span>
-  `;
+  const parts = [
+    costStr,
+    `${cost.numTurns} turns`,
+    `${duration}s`,
+    `${(cost.inputTokens + cost.outputTokens).toLocaleString()} tokens`,
+  ];
+
+  parts.forEach((text, i) => {
+    if (i > 0) {
+      const sep = document.createElement('span');
+      sep.className = 'cost-sep';
+      sep.textContent = '\u00B7';
+      el.appendChild(sep);
+    }
+    const item = document.createElement('span');
+    item.className = 'cost-item';
+    item.textContent = text;
+    el.appendChild(item);
+  });
+
   messagesEl.appendChild(el);
   return el;
 }
@@ -175,7 +346,9 @@ function renderConversation(messages) {
       <div class="welcome">
         <div class="welcome-title">Navvy</div>
         <div class="welcome-sub">I can see and interact with web pages. Tell me what to do.</div>
+        <div class="welcome-examples"></div>
       </div>`;
+    populateExamplePrompts();
     return;
   }
 
@@ -205,26 +378,139 @@ function renderConversation(messages) {
   scrollToBottom();
 }
 
+function getContextualPrompts(url, title) {
+  if (!url || url === 'chrome://newtab/' || url.startsWith('chrome://')) {
+    return [
+      'Summarize the content on this page',
+      'Find all links on this page',
+      'Take a screenshot and describe what you see',
+    ];
+  }
+
+  let domain = '';
+  try { domain = new URL(url).hostname.replace('www.', ''); } catch { /* ignore */ }
+  const lowerUrl = url.toLowerCase();
+  const lowerTitle = (title || '').toLowerCase();
+
+  // Search engines
+  if (domain.includes('google.com') && lowerUrl.includes('/search')) {
+    return [
+      'Click the first organic search result',
+      'Summarize the top 5 results',
+      'Search for something else: ',
+    ];
+  }
+
+  // Shopping / e-commerce
+  if (['amazon.com', 'ebay.com', 'walmart.com', 'target.com', 'etsy.com'].some(d => domain.includes(d))) {
+    if (lowerUrl.includes('/cart') || lowerUrl.includes('/basket')) {
+      return ['Proceed to checkout', 'Remove the most expensive item', 'Summarize what\'s in my cart'];
+    }
+    if (lowerUrl.includes('/dp/') || lowerUrl.includes('/product') || lowerUrl.includes('/itm/')) {
+      return ['Add this item to cart', 'What are the top reviews saying?', 'Find a cheaper alternative'];
+    }
+    return ['Search for headphones under $50', 'Show me today\'s deals', 'Find the best-rated items'];
+  }
+
+  // Social media
+  if (['twitter.com', 'x.com', 'reddit.com', 'facebook.com', 'linkedin.com'].some(d => domain.includes(d))) {
+    return ['Summarize the posts on this page', 'Scroll down and find trending topics', 'Describe what\'s on screen'];
+  }
+
+  // GitHub
+  if (domain.includes('github.com')) {
+    if (lowerUrl.includes('/pull/') || lowerUrl.includes('/issues/')) {
+      return ['Summarize this discussion', 'List the files changed', 'Scroll to the latest comment'];
+    }
+    return ['Describe this repository', 'Find the most recent commits', 'Navigate to the Issues tab'];
+  }
+
+  // Forms / login
+  if (lowerUrl.includes('/login') || lowerUrl.includes('/signin') || lowerUrl.includes('/register') || lowerUrl.includes('/signup')) {
+    return ['Fill out this form with test data', 'What fields are on this form?', 'Submit the form'];
+  }
+
+  // Generic page-aware prompts
+  const prompts = ['Summarize the content on this page'];
+  if (lowerTitle || domain) {
+    prompts.push(`What can I do on ${domain || 'this site'}?`);
+  }
+  prompts.push('Find all buttons and links on this page');
+  return prompts;
+}
+
+async function populateExamplePrompts() {
+  const container = document.querySelector('.welcome-examples');
+  if (!container) return;
+
+  let url = '', title = '';
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tab) { url = tab.url || ''; title = tab.title || ''; }
+  } catch { /* ignore */ }
+
+  const prompts = getContextualPrompts(url, title);
+  container.innerHTML = '';
+  for (const text of prompts) {
+    const btn = document.createElement('button');
+    btn.className = 'example-prompt';
+    btn.textContent = text;
+    btn.addEventListener('click', () => {
+      promptInput.value = text;
+      promptInput.focus();
+      autoResize();
+    });
+    container.appendChild(btn);
+  }
+}
+
 // ---- WebSocket Connection ----
+
+let wasConnected = false;
+
+function showConnectionToast(type, message) {
+  const existing = document.querySelector('.connection-toast');
+  if (existing) existing.remove();
+
+  const toast = document.createElement('div');
+  toast.className = `connection-toast ${type}`;
+  toast.textContent = message;
+  document.body.appendChild(toast);
+  requestAnimationFrame(() => toast.classList.add('visible'));
+  setTimeout(() => {
+    toast.classList.remove('visible');
+    setTimeout(() => toast.remove(), 300);
+  }, 2500);
+}
 
 function connectWebSocket() {
   if (ws) {
     ws.close();
   }
 
+  setStatus('connecting', 'Connecting...');
   ws = new WebSocket(serverUrl);
 
   ws.onopen = () => {
     setStatus('connected', 'Connected');
+    if (wasConnected === false) {
+      // First connection — no toast
+    } else {
+      showConnectionToast('connected', 'Connection restored');
+    }
+    wasConnected = true;
   };
 
   ws.onclose = () => {
     setStatus('disconnected', 'Disconnected');
+    if (wasConnected) {
+      showConnectionToast('disconnected', 'Connection lost — retrying...');
+    }
     setTimeout(connectWebSocket, 3000);
   };
 
   ws.onerror = () => {
-    setStatus('disconnected', 'Connection error');
+    // onclose will fire after this
   };
 
   ws.onmessage = (event) => {
@@ -307,6 +593,10 @@ function handleServerMessage(msg) {
       break;
 
     case 'done':
+      if (cancelTimeout) {
+        finalizeCancellation();
+        break;
+      }
       // Final flush
       flushTextBuffer();
       flushThinkingBuffer();
@@ -316,10 +606,18 @@ function handleServerMessage(msg) {
       }
       setRunning(false);
       setStatus('connected', 'Done');
-      checkStorageUsage().catch(console.error);
+      checkStorageUsage().then(deleted => {
+        if (deleted > 0) {
+          showConnectionToast('disconnected', `${deleted} old conversation${deleted > 1 ? 's' : ''} removed to free storage`);
+        }
+      }).catch(console.error);
       break;
 
     case 'error':
+      if (cancelTimeout) {
+        finalizeCancellation();
+        break;
+      }
       addErrorMessage(msg.error);
       // Save error record
       if (activeConversationId) {
@@ -424,7 +722,7 @@ function addToolStart(toolName, toolId) {
 
   const name = document.createElement('span');
   name.className = 'tool-name';
-  name.textContent = toolName;
+  name.textContent = formatToolName(toolName);
   header.appendChild(name);
 
   const spinner = document.createElement('span');
@@ -553,7 +851,24 @@ function setRunning(running) {
 
 async function sendPrompt() {
   const text = promptInput.value.trim();
-  if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+  if (!text) return;
+
+  // Check for slash commands first
+  const parsed = parseSlashCommand(text);
+  if (parsed) {
+    promptInput.value = '';
+    autoResize();
+    hideSlashPopup();
+    await handleSlashCommand(parsed);
+    return;
+  }
+
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    showConnectionToast('disconnected', 'Not connected to server');
+    return;
+  }
+
+  hideSlashPopup();
 
   // Render and persist user message immediately
   renderUserMessage(text);
@@ -565,6 +880,7 @@ async function sendPrompt() {
     type: 'prompt',
     sessionId,
     prompt: text,
+    mode: currentMode,
     attachments: attachments.length > 0 ? attachments : undefined,
   };
 
@@ -577,11 +893,30 @@ async function sendPrompt() {
   scrollToBottom();
 }
 
+let cancelTimeout = null;
+
 function cancelTask() {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'cancel', sessionId }));
   }
-  // Flush any pending accumulator data before cancelling
+
+  // Show cancelling state
+  setStatus('thinking', 'Cancelling...');
+  btnCancel.disabled = true;
+  showActivityIndicator('Cancelling');
+
+  // Wait up to 3s for server to confirm (via 'done' or 'error'), then force reset
+  cancelTimeout = setTimeout(() => {
+    finalizeCancellation();
+  }, 3000);
+}
+
+function finalizeCancellation() {
+  if (cancelTimeout) {
+    clearTimeout(cancelTimeout);
+    cancelTimeout = null;
+  }
+  // Flush any pending accumulator data
   flushTextBuffer();
   flushThinkingBuffer();
   if (pendingTurn.length > 0 && activeConversationId) {
@@ -589,6 +924,7 @@ function cancelTask() {
     pendingTurn = [];
   }
   setRunning(false);
+  btnCancel.disabled = false;
   setStatus('connected', 'Cancelled');
 
   const el = document.createElement('div');
@@ -793,10 +1129,13 @@ function formatRelativeTime(date) {
 
 async function boot() {
   // Load settings
-  const settingsResult = await chrome.storage.local.get(['serverUrl']);
+  const settingsResult = await chrome.storage.local.get(['serverUrl', 'currentMode']);
   if (settingsResult.serverUrl) {
     serverUrl = settingsResult.serverUrl;
     settingServerUrl.value = serverUrl;
+  }
+  if (settingsResult.currentMode) {
+    setMode(settingsResult.currentMode);
   }
 
   // Load or create active conversation
@@ -833,11 +1172,36 @@ btnCancel.addEventListener('click', cancelTask);
 btnAttach.addEventListener('click', attachFile);
 btnPage.addEventListener('click', attachPageContext);
 
-promptInput.addEventListener('input', autoResize);
+// Mode chip handlers
+document.querySelectorAll('.mode-chip').forEach((chip) => {
+  chip.addEventListener('click', () => {
+    setMode(chip.dataset.mode);
+  });
+});
+
+promptInput.addEventListener('input', () => {
+  autoResize();
+  // Slash command popup
+  const val = promptInput.value;
+  if (val.startsWith('/') && !val.includes(' ')) {
+    showSlashPopup(val);
+  } else {
+    hideSlashPopup();
+  }
+});
+
+promptInput.addEventListener('blur', () => {
+  // Delay to allow click on popup items
+  setTimeout(hideSlashPopup, 150);
+});
+
 promptInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
     sendPrompt();
+  }
+  if (e.key === 'Escape') {
+    hideSlashPopup();
   }
 });
 
@@ -851,6 +1215,18 @@ btnSettingsSave.addEventListener('click', () => {
 
 btnSettingsCancel.addEventListener('click', () => {
   settingsOverlay.style.display = 'none';
+});
+
+// Settings
+btnSettings.addEventListener('click', () => {
+  settingServerUrl.value = serverUrl;
+  settingsOverlay.style.display = 'flex';
+});
+
+settingsOverlay.addEventListener('click', (e) => {
+  if (e.target === settingsOverlay) {
+    settingsOverlay.style.display = 'none';
+  }
 });
 
 // Conversation list
