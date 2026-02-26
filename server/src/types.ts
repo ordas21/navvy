@@ -1,10 +1,13 @@
 // WebSocket message types between extension and server
 
+export type Mode = 'auto' | 'screenshot' | 'dom' | 'accessibility' | 'network' | 'console';
+
 export interface ClientMessage {
   type: 'prompt' | 'cancel' | 'ping';
   sessionId: string;
   prompt?: string;
   attachments?: Attachment[];
+  mode?: Mode;
 }
 
 export interface Attachment {
