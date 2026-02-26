@@ -207,6 +207,10 @@ function hideSlashPopup() {
 // ---- Render Functions (reusable for both streaming and restore) ----
 
 function renderUserMessage(text) {
+  // Remove welcome/suggestions when the first message is sent
+  const welcome = messagesEl.querySelector('.welcome');
+  if (welcome) welcome.remove();
+
   const el = document.createElement('div');
   el.className = 'message user';
   el.textContent = text;
