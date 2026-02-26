@@ -30,37 +30,37 @@ async function getDriver(): Promise<InputDriver> {
 }
 
 export async function click(x: number, y: number): Promise<void> {
-  (await getDriver()).click(x, y);
+  return (await getDriver()).click(x, y);
 }
 
 export async function doubleClick(x: number, y: number): Promise<void> {
-  (await getDriver()).doubleClick(x, y);
+  return (await getDriver()).doubleClick(x, y);
 }
 
 export async function rightClick(x: number, y: number): Promise<void> {
-  (await getDriver()).rightClick(x, y);
+  return (await getDriver()).rightClick(x, y);
 }
 
 export async function moveTo(x: number, y: number): Promise<void> {
-  (await getDriver()).moveTo(x, y);
+  return (await getDriver()).moveTo(x, y);
 }
 
 export async function type(text: string): Promise<void> {
-  (await getDriver()).type(text);
+  return (await getDriver()).type(text);
 }
 
 export async function keyPress(key: string): Promise<void> {
-  (await getDriver()).keyPress(key);
+  return (await getDriver()).keyPress(key);
 }
 
 export async function keyDown(key: string): Promise<void> {
-  (await getDriver()).keyDown(key);
+  return (await getDriver()).keyDown(key);
 }
 
 export async function keyUp(key: string): Promise<void> {
-  (await getDriver()).keyUp(key);
+  return (await getDriver()).keyUp(key);
 }
 
 export async function scroll(x: number, y: number, dy: number): Promise<void> {
-  (await getDriver()).scroll(x, y, dy);
+  return (await getDriver()).scroll(x, y, dy);
 }
