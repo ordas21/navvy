@@ -7,7 +7,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { ChildProcess } from 'node:child_process';
 import { runClaude } from './claude.js';
-import type { ClientMessage, ServerMessage } from './types.js';
+import type { ClientMessage, ServerMessage, Mode } from './types.js';
 
 const PORT = Number(process.env.PORT) || 3300;
 const UPLOAD_DIR = path.join(os.tmpdir(), 'navvy-uploads');
@@ -79,6 +79,7 @@ function handleMessage(ws: WebSocket, msg: ClientMessage): void {
 
 function handlePrompt(ws: WebSocket, msg: ClientMessage): void {
   const sessionId = msg.sessionId;
+  const mode: Mode = msg.mode ?? 'auto';
 
   // Kill any existing process for this session
   handleCancel(sessionId);
@@ -98,10 +99,11 @@ function handlePrompt(ws: WebSocket, msg: ClientMessage): void {
     prompt += attachmentText;
   }
 
+  console.log(`[session ${sessionId}] Mode: ${mode}`);
   console.log(`[session ${sessionId}] Prompt: ${prompt.substring(0, 100)}...`);
-  sendMessage(ws, { type: 'status', sessionId, status: 'Starting...' });
+  sendMessage(ws, { type: 'status', sessionId, status: `Starting (${mode} mode)...` });
 
-  const proc = runClaude(prompt, (partialMsg) => {
+  const proc = runClaude(prompt, mode, (partialMsg) => {
     sendMessage(ws, { ...partialMsg, sessionId });
 
     if (partialMsg.type === 'done') {
