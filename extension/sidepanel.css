@@ -100,6 +100,10 @@ body {
 }
 
 #status-dot.connected { background: var(--green); }
+#status-dot.connecting {
+  background: var(--accent);
+  animation: pulse 1.2s ease-in-out infinite;
+}
 #status-dot.thinking {
   background: var(--yellow);
   animation: pulse 1.2s ease-in-out infinite;
@@ -108,6 +112,120 @@ body {
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.3; }
+}
+
+/* ---- Connection toast ---- */
+.connection-toast {
+  position: fixed;
+  top: 48px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 6px 14px;
+  border-radius: var(--radius);
+  font-size: 11px;
+  font-weight: 500;
+  z-index: 200;
+  opacity: 0;
+  transition: opacity 0.3s;
+  pointer-events: none;
+}
+
+.connection-toast.visible { opacity: 1; }
+.connection-toast.connected { background: var(--green-dim); color: var(--green); border: 1px solid rgba(78, 201, 176, 0.25); }
+.connection-toast.disconnected { background: var(--red-dim); color: var(--red); border: 1px solid rgba(244, 71, 71, 0.25); }
+
+/* ---- Mode bar ---- */
+#mode-bar {
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-elevated);
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+#mode-bar::-webkit-scrollbar { display: none; }
+
+#mode-chips {
+  display: flex;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.mode-chip {
+  padding: 3px 10px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-family: var(--sans);
+  font-weight: 500;
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  flex-shrink: 0;
+}
+
+.mode-chip:hover {
+  background: var(--bg-hover);
+}
+
+.mode-chip.active {
+  background: var(--accent-dim);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* ---- System message (slash command feedback) ---- */
+.message.system-msg {
+  padding: 6px 12px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  border-left: 2px solid var(--text-faint);
+  margin: 4px 0;
+  white-space: pre-wrap;
+}
+
+/* ---- Slash command popup ---- */
+#slash-popup {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  right: 0;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 4px;
+  max-height: 200px;
+  overflow-y: auto;
+  z-index: 50;
+  box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.slash-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.slash-item:hover {
+  background: var(--bg-hover);
+}
+
+.slash-cmd {
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.slash-desc {
+  color: var(--text-muted);
+  font-size: 11px;
 }
 
 /* ---- Activity indicator ---- */
@@ -168,6 +286,34 @@ body {
 
 .welcome-sub {
   font-size: 12px;
+}
+
+.welcome-examples {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 16px;
+  align-items: center;
+}
+
+.example-prompt {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  color: var(--text);
+  font-size: 12px;
+  padding: 8px 14px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+  max-width: 260px;
+  width: 100%;
+  text-align: left;
+  font-family: var(--sans);
+}
+
+.example-prompt:hover {
+  background: var(--bg-hover);
+  border-color: var(--accent);
 }
 
 /* Base message */
@@ -324,6 +470,18 @@ body {
   font-size: 11px;
   line-height: 1.5;
   background: var(--bg);
+  position: relative;
+}
+
+.tool-input::before {
+  content: 'Input';
+  display: block;
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-faint);
+  margin-bottom: 2px;
 }
 
 .tool-result {
@@ -339,6 +497,18 @@ body {
   font-size: 11px;
   line-height: 1.5;
   background: var(--bg);
+  position: relative;
+}
+
+.tool-result::before {
+  content: 'Result';
+  display: block;
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-faint);
+  margin-bottom: 2px;
 }
 
 .message.tool-call.collapsed .tool-input,
@@ -403,6 +573,7 @@ body {
 
 /* ---- Input area ---- */
 #input-area {
+  position: relative;
   padding: 10px 12px 12px;
   border-top: 1px solid var(--border);
   background: var(--bg-elevated);
@@ -469,6 +640,11 @@ body {
   max-height: 120px;
   outline: none;
   line-height: 1.5;
+}
+
+#prompt-input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 #prompt-input::placeholder {
@@ -692,7 +868,7 @@ body {
 
 .conv-entry.active {
   background: var(--navy-dim);
-  border-left: 3px solid var(--navy);
+  border-left: 3px solid var(--accent);
   padding-left: 13px;
 }
 

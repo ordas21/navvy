@@ -20,10 +20,27 @@
             <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/>
           </svg>
         </button>
+        <button id="btn-settings" class="icon-btn" title="Settings">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/>
+          </svg>
+        </button>
         <div id="status-indicator">
           <span id="status-dot"></span>
           <span id="status-text">Disconnected</span>
         </div>
+      </div>
+    </div>
+
+    <!-- Mode bar -->
+    <div id="mode-bar">
+      <div id="mode-chips">
+        <button class="mode-chip active" data-mode="auto">Auto</button>
+        <button class="mode-chip" data-mode="screenshot">Screenshot</button>
+        <button class="mode-chip" data-mode="dom">&lt;/&gt; DOM</button>
+        <button class="mode-chip" data-mode="accessibility">A11y</button>
+        <button class="mode-chip" data-mode="network">Network</button>
+        <button class="mode-chip" data-mode="console">Console</button>
       </div>
     </div>
 
@@ -32,6 +49,7 @@
       <div class="welcome">
         <div class="welcome-title">Navvy</div>
         <div class="welcome-sub">I can see and interact with web pages. Tell me what to do.</div>
+        <div class="welcome-examples"></div>
       </div>
     </div>
 
@@ -77,6 +95,11 @@
         </div>
         <div id="conversations-list"></div>
       </div>
+    </div>
+
+    <!-- Slash command popup -->
+    <div id="slash-popup" style="display:none">
+      <div id="slash-popup-list"></div>
     </div>
 
     <!-- Settings overlay -->
