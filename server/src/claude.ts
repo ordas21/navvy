@@ -1,4 +1,4 @@
-import { spawn, ChildProcess } from 'node:child_process';
+import { spawn, execSync, ChildProcess } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -7,6 +7,15 @@ import type { ServerMessage, CostInfo, Mode } from './types.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const MCP_CONFIG = path.join(PROJECT_ROOT, 'mcp-config.json');
+
+// Resolve the full path to the claude binary at startup so spawn() works
+// even when run from contexts that don't load shell profiles (nvm, etc.)
+let CLAUDE_BIN = 'claude';
+try {
+  CLAUDE_BIN = execSync('which claude', { encoding: 'utf-8' }).trim();
+} catch {
+  // Fall back to bare name and hope it's in PATH
+}
 
 export type OnMessage = (msg: Omit<ServerMessage, 'sessionId'>) => void;
 
@@ -144,7 +153,7 @@ export function runClaude(prompt: string, mode: Mode, onMessage: OnMessage): Chi
     }
   }
 
-  const proc = spawn('claude', args, {
+  const proc = spawn(CLAUDE_BIN, args, {
     cwd: PROJECT_ROOT,
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
