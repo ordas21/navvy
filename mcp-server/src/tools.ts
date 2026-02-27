@@ -485,33 +485,33 @@ export function registerTools(server: McpServer): void {
 
   server.tool(
     'browser_drag',
-    'Drag from one element to another using native OS mouse input. Optionally dispatch HTML5 Drag and Drop API events for web apps that use the HTML5 drag API.',
+    `Drag from one element to another. Three modes:
+- Default (no flags): Uses CDP mouse events with smooth intermediate moves. Works for most drag UIs (Sortable.js, React DnD with mouse backend, custom mousedown/mousemove/mouseup handlers).
+- html5: true: Dispatches full HTML5 Drag and Drop API events (dragstart/dragenter/dragover/drop/dragend) with correct coordinates. Use for apps with [draggable="true"] and HTML5 DnD event listeners.
+- native: true: Uses OS-level mouse input (cliclick/PowerShell). Only needed for canvas-based or non-standard UIs that don't respond to CDP events.`,
     {
       from: z.string().describe('CSS selector of the drag source element'),
       to: z.string().describe('CSS selector of the drop target element'),
-      html5: z.boolean().optional().describe('Also dispatch HTML5 DragEvent sequence (dragstart → dragover → drop → dragend). Use for apps that use the HTML5 Drag and Drop API.'),
+      html5: z.boolean().optional().describe('Use HTML5 Drag and Drop API events (for [draggable="true"] elements)'),
+      native: z.boolean().optional().describe('Use OS-level mouse input instead of CDP (for canvas/non-standard UIs)'),
+      steps: z.number().optional().describe('Number of intermediate mouse moves (default 10, increase for sensitive UIs)'),
     },
-    async ({ from, to, html5 }) => {
-      const fromCoords = await elementToScreenCoords(from);
-      const toCoords = await elementToScreenCoords(to);
-      await input.drag(fromCoords.x, fromCoords.y, toCoords.x, toCoords.y);
-
+    async ({ from, to, html5, native, steps }) => {
       if (html5) {
-        await cdp.evaluate(`
-          (function() {
-            var src = document.querySelector(${JSON.stringify(from)});
-            var dst = document.querySelector(${JSON.stringify(to)});
-            if (!src || !dst) throw new Error('Drag source or target not found');
-            var dataTransfer = new DataTransfer();
-            src.dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer: dataTransfer }));
-            dst.dispatchEvent(new DragEvent('dragover', { bubbles: true, dataTransfer: dataTransfer }));
-            dst.dispatchEvent(new DragEvent('drop', { bubbles: true, dataTransfer: dataTransfer }));
-            src.dispatchEvent(new DragEvent('dragend', { bubbles: true, dataTransfer: dataTransfer }));
-          })()
-        `);
+        const result = await cdp.dragHTML5(from, to);
+        return { content: [{ type: 'text', text: `Dragged "${from}" → "${to}" (HTML5 DnD API) — ${result.success ? 'OK' : 'failed'}` }] };
       }
 
-      return { content: [{ type: 'text', text: `Dragged "${from}" → "${to}"${html5 ? ' (with HTML5 DragEvent)' : ''}` }] };
+      if (native) {
+        const fromCoords = await elementToScreenCoords(from);
+        const toCoords = await elementToScreenCoords(to);
+        await input.drag(fromCoords.x, fromCoords.y, toCoords.x, toCoords.y);
+        return { content: [{ type: 'text', text: `Dragged "${from}" → "${to}" (native OS input)` }] };
+      }
+
+      // Default: CDP mouse events with smooth interpolation
+      const result = await cdp.dragCDP(from, to, steps ?? 10);
+      return { content: [{ type: 'text', text: `Dragged "${from}" → "${to}" (CDP, ${result.steps} steps, ${result.from.x.toFixed(0)},${result.from.y.toFixed(0)} → ${result.to.x.toFixed(0)},${result.to.y.toFixed(0)})` }] };
     }
   );
 }

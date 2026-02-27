@@ -53,7 +53,7 @@ That's 3-4 tool calls total. NOT one per field.
 - browser_scroll_to: scroll a specific element into view
 - browser_scroll: scroll page or container
 - browser_double_click / browser_right_click: specialized clicks
-- browser_drag: drag and drop (html5: true for HTML5 DnD apps)
+- browser_drag: drag and drop — default uses CDP smooth mouse moves (works for most UIs); html5:true for [draggable="true"] elements using HTML5 DnD API; native:true for canvas/non-standard UIs
 - browser_hover: reveal hidden menus/tooltips
 - browser_select: select dropdown option
 - browser_screenshot: visual verification ONLY when needed (not as a first step)

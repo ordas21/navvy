@@ -785,6 +785,153 @@ export async function scrollInContainer(containerSelector: string, direction: 'u
   `);
 }
 
+// ---- CDP-Level Drag ----
+
+interface DragResult {
+  success: boolean;
+  from: { x: number; y: number };
+  to: { x: number; y: number };
+  steps: number;
+}
+
+/**
+ * Drag from one element to another using CDP Input.dispatchMouseEvent.
+ * This works inside the browser viewport (no OS-level input needed),
+ * produces smooth intermediate moves, and triggers all DOM mouse events.
+ */
+export async function dragCDP(
+  fromSelector: string,
+  toSelector: string,
+  steps: number = 10,
+  durationMs: number = 300,
+): Promise<DragResult> {
+  const cdp = await getClient();
+
+  // Get element center coordinates (viewport-relative)
+  const fromBounds = await getElementBounds(fromSelector);
+  const toBounds = await getElementBounds(toSelector);
+
+  const fromX = fromBounds.x + fromBounds.width / 2;
+  const fromY = fromBounds.y + fromBounds.height / 2;
+  const toX = toBounds.x + toBounds.width / 2;
+  const toY = toBounds.y + toBounds.height / 2;
+
+  const stepDelay = durationMs / steps;
+
+  // 1. Move to source and press
+  await cdp.Input.dispatchMouseEvent({
+    type: 'mouseMoved',
+    x: fromX,
+    y: fromY,
+  });
+  await new Promise(r => setTimeout(r, 20));
+
+  await cdp.Input.dispatchMouseEvent({
+    type: 'mousePressed',
+    x: fromX,
+    y: fromY,
+    button: 'left',
+    clickCount: 1,
+  });
+  await new Promise(r => setTimeout(r, 50));
+
+  // 2. Smooth intermediate moves
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    const x = fromX + (toX - fromX) * t;
+    const y = fromY + (toY - fromY) * t;
+    await cdp.Input.dispatchMouseEvent({
+      type: 'mouseMoved',
+      x,
+      y,
+      button: 'left',
+    });
+    await new Promise(r => setTimeout(r, stepDelay));
+  }
+
+  // 3. Release at target
+  await new Promise(r => setTimeout(r, 30));
+  await cdp.Input.dispatchMouseEvent({
+    type: 'mouseReleased',
+    x: toX,
+    y: toY,
+    button: 'left',
+    clickCount: 1,
+  });
+
+  return { success: true, from: { x: fromX, y: fromY }, to: { x: toX, y: toY }, steps };
+}
+
+/**
+ * Drag using the HTML5 Drag and Drop API with full event sequence and
+ * proper coordinates. For apps that use dragstart/dragover/drop events.
+ */
+export async function dragHTML5(
+  fromSelector: string,
+  toSelector: string,
+): Promise<{ success: boolean }> {
+  return evaluate<{ success: boolean }>(`
+    (function() {
+      var src = document.querySelector(${JSON.stringify(fromSelector)});
+      var dst = document.querySelector(${JSON.stringify(toSelector)});
+      if (!src) throw new Error('Drag source not found: ${fromSelector}');
+      if (!dst) throw new Error('Drop target not found: ${toSelector}');
+
+      var srcRect = src.getBoundingClientRect();
+      var dstRect = dst.getBoundingClientRect();
+      var srcX = srcRect.left + srcRect.width / 2;
+      var srcY = srcRect.top + srcRect.height / 2;
+      var dstX = dstRect.left + dstRect.width / 2;
+      var dstY = dstRect.top + dstRect.height / 2;
+
+      var dataTransfer = new DataTransfer();
+
+      function fire(el, type, x, y, dt) {
+        var opts = {
+          bubbles: true,
+          cancelable: true,
+          clientX: x,
+          clientY: y,
+          screenX: x + window.screenX,
+          screenY: y + window.screenY,
+          dataTransfer: dt
+        };
+        el.dispatchEvent(new DragEvent(type, opts));
+      }
+
+      // mousedown on source
+      src.dispatchEvent(new MouseEvent('mousedown', {
+        bubbles: true, clientX: srcX, clientY: srcY, button: 0
+      }));
+
+      // Full drag sequence
+      fire(src, 'dragstart', srcX, srcY, dataTransfer);
+      fire(src, 'drag', srcX, srcY, dataTransfer);
+
+      // Enter target with intermediate moves
+      fire(dst, 'dragenter', dstX, dstY, dataTransfer);
+      // Multiple dragovers (some frameworks need repeated events)
+      for (var i = 0; i < 3; i++) {
+        fire(dst, 'dragover', dstX, dstY, dataTransfer);
+      }
+
+      // Leave source
+      fire(src, 'dragleave', dstX, dstY, dataTransfer);
+
+      // Drop and end
+      fire(dst, 'drop', dstX, dstY, dataTransfer);
+      fire(src, 'dragend', dstX, dstY, dataTransfer);
+
+      // mouseup
+      dst.dispatchEvent(new MouseEvent('mouseup', {
+        bubbles: true, clientX: dstX, clientY: dstY, button: 0
+      }));
+
+      return { success: true };
+    })()
+  `);
+}
+
 export async function disconnect(): Promise<void> {
   if (client) {
     await client.close();
