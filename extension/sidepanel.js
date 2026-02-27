@@ -79,6 +79,7 @@ const TOOL_LABELS = {
   browser_double_click: 'Double Click',
   browser_right_click: 'Right Click',
   browser_drag: 'Drag',
+  browser_reorder: 'Reorder List',
 };
 
 function formatToolName(raw) {

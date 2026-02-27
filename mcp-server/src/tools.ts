@@ -510,8 +510,32 @@ export function registerTools(server: McpServer): void {
       }
 
       // Default: CDP mouse events with smooth interpolation
-      const result = await cdp.dragCDP(from, to, steps ?? 10);
+      const result = await cdp.dragCDP(from, to, steps ?? 15);
       return { content: [{ type: 'text', text: `Dragged "${from}" → "${to}" (CDP, ${result.steps} steps, ${result.from.x.toFixed(0)},${result.from.y.toFixed(0)} → ${result.to.x.toFixed(0)},${result.to.y.toFixed(0)})` }] };
+    }
+  );
+
+  // ---- browser_reorder ----
+  server.tool(
+    'browser_reorder',
+    `Reorder items in a sortable list by specifying the desired order.
+Works with SortableJS, react-sortable-hoc, @dnd-kit, and plain DOM lists.
+Provide the container CSS selector and an array of 0-based indices representing the new order.
+Example: to move the 3rd item to position 1 in a 4-item list, use newOrder: [0, 2, 1, 3].`,
+    {
+      containerSelector: z.string().describe('CSS selector of the sortable list container'),
+      newOrder: z.array(z.number()).describe('Array of 0-based indices in the desired new order (e.g. [2, 0, 1] moves item 2 first)'),
+    },
+    async ({ containerSelector, newOrder }) => {
+      const result = await cdp.reorderList(containerSelector, newOrder);
+      if (result.success) {
+        const lines = [`Reordered ${result.newOrder.length} items (${result.method})`];
+        lines.push(`Before: ${result.previousOrder.map((t, i) => `[${i}] ${t}`).join(', ')}`);
+        lines.push(`After:  ${result.newOrder.map((t, i) => `[${i}] ${t}`).join(', ')}`);
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+      } else {
+        return { content: [{ type: 'text', text: `Reorder failed: ${result.error ?? 'unknown error'}` }], isError: true };
+      }
     }
   );
 }
