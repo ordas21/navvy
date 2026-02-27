@@ -2,7 +2,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import * as cdp from './cdp.js';
 import * as input from './input.js';
-import { elementToScreenCoords } from './coordinates.js';
+import { elementToScreenCoords, pageToScreenCoords } from './coordinates.js';
+import { generateSplinePath } from './motion.js';
 
 export function registerTools(server: McpServer): void {
 
@@ -494,9 +495,10 @@ export function registerTools(server: McpServer): void {
       to: z.string().describe('CSS selector of the drop target element'),
       html5: z.boolean().optional().describe('Use HTML5 Drag and Drop API events (for [draggable="true"] elements)'),
       native: z.boolean().optional().describe('Use OS-level mouse input instead of CDP (for canvas/non-standard UIs)'),
-      steps: z.number().optional().describe('Number of intermediate mouse moves (default 10, increase for sensitive UIs)'),
+      steps: z.number().optional().describe('Number of intermediate mouse moves (default 15, increase for sensitive UIs)'),
+      activationDirection: z.enum(['auto', 'horizontal', 'vertical']).optional().describe('Direction of initial activation move: auto (toward target), horizontal, or vertical. Default: auto'),
     },
-    async ({ from, to, html5, native, steps }) => {
+    async ({ from, to, html5, native, steps, activationDirection }) => {
       if (html5) {
         const result = await cdp.dragHTML5(from, to);
         return { content: [{ type: 'text', text: `Dragged "${from}" → "${to}" (HTML5 DnD API) — ${result.success ? 'OK' : 'failed'}` }] };
@@ -505,13 +507,90 @@ export function registerTools(server: McpServer): void {
       if (native) {
         const fromCoords = await elementToScreenCoords(from);
         const toCoords = await elementToScreenCoords(to);
-        await input.drag(fromCoords.x, fromCoords.y, toCoords.x, toCoords.y);
-        return { content: [{ type: 'text', text: `Dragged "${from}" → "${to}" (native OS input)` }] };
+        await input.dragSmooth(fromCoords.x, fromCoords.y, toCoords.x, toCoords.y, steps ?? 20);
+        return { content: [{ type: 'text', text: `Dragged "${from}" → "${to}" (native smooth, ${steps ?? 20} steps)` }] };
       }
 
-      // Default: CDP mouse events with smooth interpolation
-      const result = await cdp.dragCDP(from, to, steps ?? 15);
+      // Default: CDP mouse events with bezier-eased interpolation
+      const result = await cdp.dragCDP(from, to, steps ?? 15, 500, activationDirection ?? 'auto');
       return { content: [{ type: 'text', text: `Dragged "${from}" → "${to}" (CDP, ${result.steps} steps, ${result.from.x.toFixed(0)},${result.from.y.toFixed(0)} → ${result.to.x.toFixed(0)},${result.to.y.toFixed(0)})` }] };
+    }
+  );
+
+  // ---- browser_draw ----
+  server.tool(
+    'browser_draw',
+    `Draw a smooth path through a series of viewport-coordinate waypoints.
+Uses Catmull-Rom spline interpolation for C1 continuity between segments.
+Use cases: signing documents, drawing shapes, connecting diagram nodes, canvas interactions.
+- Default: uses CDP mouse events (works for most canvas/drawing apps)
+- native: true: routes through OS-level input for apps needing real OS events`,
+    {
+      waypoints: z.array(z.object({
+        x: z.number().describe('Viewport X coordinate'),
+        y: z.number().describe('Viewport Y coordinate'),
+      })).min(2).describe('Array of 2+ viewport-coordinate waypoints to draw through'),
+      steps: z.number().optional().describe('Total number of interpolated points (default 30)'),
+      durationMs: z.number().optional().describe('Total drawing duration in milliseconds (default 600)'),
+      native: z.boolean().optional().describe('Use OS-level mouse input instead of CDP'),
+    },
+    async ({ waypoints, steps, durationMs, native }) => {
+      const path = generateSplinePath(waypoints, {
+        steps: steps ?? 30,
+        durationMs: durationMs ?? 600,
+        easing: 'easeInOutCubic',
+      });
+
+      if (native) {
+        // Route through OS input using dragSmooth from first to last point
+        const first = path[0];
+        const last = path[path.length - 1];
+        const screenFirst = await pageToScreenCoords(first.x, first.y);
+        const screenLast = await pageToScreenCoords(last.x, last.y);
+        await input.dragSmooth(screenFirst.x, screenFirst.y, screenLast.x, screenLast.y, steps ?? 30, durationMs ?? 600);
+        return { content: [{ type: 'text', text: `Drew path through ${waypoints.length} waypoints (native, ${path.length} points)` }] };
+      }
+
+      const result = await cdp.drawCDP(path);
+      return { content: [{ type: 'text', text: `Drew path through ${waypoints.length} waypoints (CDP, ${result.pointCount} points)` }] };
+    }
+  );
+
+  // ---- browser_move_smoothly ----
+  server.tool(
+    'browser_move_smoothly',
+    `Move the cursor smoothly along a bezier curve to a target element or coordinates.
+Uses OS-level input with eased motion for natural deceleration.
+For hover effects requiring gradual approach (menus tracking mouse velocity, tooltip animations).`,
+    {
+      selector: z.string().optional().describe('CSS selector of the target element (alternative to x/y)'),
+      x: z.number().optional().describe('Target viewport X coordinate'),
+      y: z.number().optional().describe('Target viewport Y coordinate'),
+      fromX: z.number().optional().describe('Starting viewport X coordinate (default: current cursor position estimated as 0,0)'),
+      fromY: z.number().optional().describe('Starting viewport Y coordinate'),
+      durationMs: z.number().optional().describe('Duration of movement in milliseconds (default 300)'),
+    },
+    async ({ selector, x, y, fromX, fromY, durationMs }) => {
+      let targetX: number;
+      let targetY: number;
+
+      if (selector) {
+        const coords = await elementToScreenCoords(selector);
+        targetX = coords.x;
+        targetY = coords.y;
+      } else if (x !== undefined && y !== undefined) {
+        const coords = await pageToScreenCoords(x, y);
+        targetX = coords.x;
+        targetY = coords.y;
+      } else {
+        return { content: [{ type: 'text', text: 'Must provide either selector or both x and y coordinates' }], isError: true };
+      }
+
+      const startX = fromX !== undefined ? (await pageToScreenCoords(fromX, fromY ?? 0)).x : targetX - 100;
+      const startY = fromY !== undefined ? (await pageToScreenCoords(0, fromY)).y : targetY - 50;
+
+      await input.moveSmooth(targetX, targetY, startX, startY, 15, durationMs ?? 300);
+      return { content: [{ type: 'text', text: `Moved cursor smoothly to ${selector ?? `(${x},${y})`} over ${durationMs ?? 300}ms` }] };
     }
   );
 

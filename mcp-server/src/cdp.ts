@@ -1,4 +1,5 @@
 import CDP from 'chrome-remote-interface';
+import { generatePath, computeDelays, type TimedPoint } from './motion.js';
 
 let client: CDP.Client | null = null;
 let currentTargetId: string | null = null;
@@ -810,6 +811,7 @@ export async function dragCDP(
   toSelector: string,
   steps: number = 15,
   durationMs: number = 500,
+  activationDirection: 'auto' | 'horizontal' | 'vertical' = 'auto',
 ): Promise<DragResult> {
   const cdp = await getClient();
 
@@ -821,8 +823,6 @@ export async function dragCDP(
   const fromY = fromBounds.y + fromBounds.height / 2;
   const toX = toBounds.x + toBounds.width / 2;
   const toY = toBounds.y + toBounds.height / 2;
-
-  const stepDelay = durationMs / steps;
 
   // 1. Move to source element
   await cdp.Input.dispatchMouseEvent({
@@ -845,26 +845,44 @@ export async function dragCDP(
   await new Promise(r => setTimeout(r, 200));
 
   // 3. Small initial move to cross the drag activation distance (5px)
+  let activationX = fromX;
+  let activationY = fromY;
+  if (activationDirection === 'vertical') {
+    activationY += (toY > fromY ? 5 : -5);
+  } else if (activationDirection === 'horizontal') {
+    activationX += (toX > fromX ? 5 : -5);
+  } else {
+    // 'auto' — move 5px toward target
+    const dx = toX - fromX;
+    const dy = toY - fromY;
+    const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+    activationX += (dx / dist) * 5;
+    activationY += (dy / dist) * 5;
+  }
   await cdp.Input.dispatchMouseEvent({
     type: 'mouseMoved',
-    x: fromX,
-    y: fromY + (toY > fromY ? 5 : -5),
+    x: activationX,
+    y: activationY,
     buttons: 1,
   });
   await new Promise(r => setTimeout(r, 50));
 
-  // 4. Smooth intermediate moves with buttons: 1
-  for (let i = 1; i <= steps; i++) {
-    const t = i / steps;
-    const x = fromX + (toX - fromX) * t;
-    const y = fromY + (toY - fromY) * t;
+  // 4. Smooth bezier-eased intermediate moves with buttons: 1
+  const path = generatePath(
+    { x: fromX, y: fromY },
+    { x: toX, y: toY },
+    { durationMs, steps, easing: 'easeInOutCubic', jitter: 1.5 },
+  );
+  const delays = computeDelays(path);
+
+  for (let i = 1; i < path.length; i++) {
     await cdp.Input.dispatchMouseEvent({
       type: 'mouseMoved',
-      x,
-      y,
+      x: path[i].x,
+      y: path[i].y,
       buttons: 1,
     });
-    await new Promise(r => setTimeout(r, stepDelay));
+    await new Promise(r => setTimeout(r, delays[i - 1]));
   }
 
   // 5. Hold at target briefly
@@ -881,6 +899,65 @@ export async function dragCDP(
   });
 
   return { success: true, from: { x: fromX, y: fromY }, to: { x: toX, y: toY }, steps };
+}
+
+/**
+ * Draw a path through timed points using CDP mouse events.
+ * For canvas drawing, signatures, connecting diagram nodes, etc.
+ */
+export async function drawCDP(
+  points: TimedPoint[],
+): Promise<{ success: boolean; pointCount: number }> {
+  if (points.length < 2) {
+    throw new Error('drawCDP requires at least 2 points');
+  }
+
+  const cdp = await getClient();
+  const delays = computeDelays(points);
+
+  // 1. Move to first point (no buttons)
+  await cdp.Input.dispatchMouseEvent({
+    type: 'mouseMoved',
+    x: points[0].x,
+    y: points[0].y,
+    buttons: 0,
+  });
+  await new Promise(r => setTimeout(r, 50));
+
+  // 2. Press at first point
+  await cdp.Input.dispatchMouseEvent({
+    type: 'mousePressed',
+    x: points[0].x,
+    y: points[0].y,
+    button: 'left',
+    buttons: 1,
+    clickCount: 1,
+  });
+  await new Promise(r => setTimeout(r, 30));
+
+  // 3. Move through all intermediate points (button held)
+  for (let i = 1; i < points.length; i++) {
+    await cdp.Input.dispatchMouseEvent({
+      type: 'mouseMoved',
+      x: points[i].x,
+      y: points[i].y,
+      buttons: 1,
+    });
+    await new Promise(r => setTimeout(r, delays[i - 1]));
+  }
+
+  // 4. Release at last point
+  const last = points[points.length - 1];
+  await cdp.Input.dispatchMouseEvent({
+    type: 'mouseReleased',
+    x: last.x,
+    y: last.y,
+    button: 'left',
+    buttons: 0,
+    clickCount: 1,
+  });
+
+  return { success: true, pointCount: points.length };
 }
 
 /**

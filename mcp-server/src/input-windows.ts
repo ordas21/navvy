@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { generatePath, computeDelays } from './motion.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -61,6 +62,63 @@ Start-Sleep -Milliseconds 50
 [WinInput]::SetCursorPos(${Math.round(toX)}, ${Math.round(toY)})
 Start-Sleep -Milliseconds 50
 [WinInput]::mouse_event([WinInput]::MOUSEEVENTF_LEFTUP, 0, 0, 0, [IntPtr]::Zero)`);
+}
+
+/**
+ * Smooth multi-step drag using bezier-eased path.
+ * Generates a single PowerShell script for the entire motion.
+ */
+export async function dragSmooth(
+  fromX: number, fromY: number, toX: number, toY: number,
+  steps: number = 20, durationMs: number = 500,
+): Promise<void> {
+  const path = generatePath(
+    { x: fromX, y: fromY },
+    { x: toX, y: toY },
+    { steps, durationMs, easing: 'easeInOutCubic' },
+  );
+  const delays = computeDelays(path);
+
+  const lines = [MOUSE_SETUP];
+  lines.push(`[WinInput]::SetCursorPos(${Math.round(path[0].x)}, ${Math.round(path[0].y)})`);
+  lines.push(`[WinInput]::mouse_event([WinInput]::MOUSEEVENTF_LEFTDOWN, 0, 0, 0, [IntPtr]::Zero)`);
+
+  for (let i = 1; i < path.length; i++) {
+    const delay = Math.max(1, delays[i - 1]);
+    lines.push(`Start-Sleep -Milliseconds ${delay}`);
+    lines.push(`[WinInput]::SetCursorPos(${Math.round(path[i].x)}, ${Math.round(path[i].y)})`);
+  }
+
+  lines.push(`Start-Sleep -Milliseconds 10`);
+  lines.push(`[WinInput]::mouse_event([WinInput]::MOUSEEVENTF_LEFTUP, 0, 0, 0, [IntPtr]::Zero)`);
+
+  await ps(lines.join('\n'));
+}
+
+/**
+ * Smooth cursor movement (no button held) using bezier-eased path.
+ * Uses easeOutCubic for natural deceleration-to-target feel.
+ */
+export async function moveSmooth(
+  toX: number, toY: number, fromX: number, fromY: number,
+  steps: number = 15, durationMs: number = 300,
+): Promise<void> {
+  const path = generatePath(
+    { x: fromX, y: fromY },
+    { x: toX, y: toY },
+    { steps, durationMs, easing: 'easeOutCubic' },
+  );
+  const delays = computeDelays(path);
+
+  const lines = [MOUSE_SETUP];
+  for (let i = 0; i < path.length; i++) {
+    if (i > 0) {
+      lines.push(`Start-Sleep -Milliseconds ${Math.max(1, delays[i - 1])}`);
+    }
+    lines.push(`[WinInput]::SetCursorPos(${Math.round(path[i].x)}, ${Math.round(path[i].y)})`);
+  }
+
+  await ps(lines.join('\n'));
 }
 
 // Key mapping from cliclick names to SendKeys tokens
