@@ -26,3 +26,6 @@ npm-debug.log*
 # Temporary files
 tmp/
 *.tmp
+
+# Learnings data (machine-specific)
+server/data/

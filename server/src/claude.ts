@@ -3,6 +3,7 @@ import { createInterface } from 'node:readline';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ServerMessage, CostInfo, Mode } from './types.js';
+import { SessionTracker, finalizeSession, getLearningsForPrompt, extractHostname, SELF_REVIEW_PROMPT } from './learnings.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
@@ -126,12 +127,22 @@ Use browser_console_start/get_logs/stop to capture browser console output.
 - This mode is ideal for debugging JavaScript errors, tracking application state, and finding runtime issues`,
 };
 
-function buildSystemPrompt(mode: Mode): string {
-  return BASE_PROMPT + '\n\n' + MODE_PROMPTS[mode];
+function buildSystemPrompt(mode: Mode, hostname?: string): string {
+  let prompt = BASE_PROMPT + '\n\n' + MODE_PROMPTS[mode];
+  const learnings = getLearningsForPrompt(mode, hostname);
+  if (learnings) prompt += learnings;
+  prompt += SELF_REVIEW_PROMPT;
+  return prompt;
 }
 
 export function runClaude(prompt: string, mode: Mode, onMessage: OnMessage): ChildProcess {
-  const systemPrompt = buildSystemPrompt(mode);
+  const sessionId = `session-${Date.now()}`;
+  const hostname = extractHostname(prompt);
+  const systemPrompt = buildSystemPrompt(mode, hostname);
+
+  // Create session tracker for the learnings system
+  const tracker = new SessionTracker(sessionId, mode, prompt);
+
   const args = [
     '-p', `${systemPrompt}\n\nUser task: ${prompt}`,
     '--output-format', 'stream-json',
@@ -162,10 +173,52 @@ export function runClaude(prompt: string, mode: Mode, onMessage: OnMessage): Chi
 
   console.log(`[claude] Process started, PID: ${proc.pid}`);
 
+  // Wrap onMessage to feed events into the tracker
+  const trackedOnMessage: OnMessage = (msg) => {
+    // Feed tracking data before forwarding
+    switch (msg.type) {
+      case 'tool_use_start':
+        if (msg.toolName && msg.toolId) {
+          tracker.addToolCall(msg.toolName, msg.toolId);
+        }
+        break;
+      case 'tool_use_input_delta':
+        if (msg.toolId && msg.toolInput) {
+          tracker.updateToolInput(msg.toolId, msg.toolInput);
+        }
+        break;
+      case 'tool_result':
+        if (msg.toolId && msg.toolResult) {
+          tracker.addToolResult(msg.toolId, msg.toolResult);
+        }
+        break;
+      case 'text_delta':
+        if (msg.text) {
+          tracker.addText(msg.text);
+        }
+        break;
+      case 'cost':
+        if (msg.cost) {
+          tracker.setCost(msg.cost);
+        }
+        break;
+      case 'done':
+        // Finalize session and persist learnings
+        try {
+          finalizeSession(tracker);
+        } catch (err) {
+          console.error('[learnings] Failed to finalize session:', err);
+        }
+        break;
+    }
+    // Forward to original handler
+    onMessage(msg);
+  };
+
   // Warn if no output after 15 seconds
   const startupTimer = setTimeout(() => {
     console.log('[claude] WARNING: No output after 15s — CLI may be hanging');
-    onMessage({ type: 'status', status: 'Waiting for Claude CLI...' });
+    trackedOnMessage({ type: 'status', status: 'Waiting for Claude CLI...' });
   }, 15000);
 
   const rl = createInterface({ input: proc.stdout! });
@@ -177,7 +230,7 @@ export function runClaude(prompt: string, mode: Mode, onMessage: OnMessage): Chi
     if (!line.trim()) return;
     try {
       const event = JSON.parse(line);
-      handleEvent(event, onMessage, activeBlocks);
+      handleEvent(event, trackedOnMessage, activeBlocks);
     } catch {
       console.log('[claude:stdout]', line.substring(0, 200));
     }
@@ -207,17 +260,17 @@ export function runClaude(prompt: string, mode: Mode, onMessage: OnMessage): Chi
     console.log(`[claude] Process exited with code ${code}`);
     if (code !== 0) {
       const errMsg = stderrBuffer.trim() || `Claude exited with code ${code}`;
-      onMessage({ type: 'error', error: errMsg });
+      trackedOnMessage({ type: 'error', error: errMsg });
     }
     if (!hasOutput) {
       console.log('[claude] WARNING: Process exited with no stdout output');
-      onMessage({ type: 'error', error: 'Claude CLI produced no output. Check that "claude" is working.' });
+      trackedOnMessage({ type: 'error', error: 'Claude CLI produced no output. Check that "claude" is working.' });
     }
   });
 
   proc.on('error', (err) => {
     console.error('[claude] Spawn error:', err.message);
-    onMessage({ type: 'error', error: `Failed to spawn Claude: ${err.message}` });
+    trackedOnMessage({ type: 'error', error: `Failed to spawn Claude: ${err.message}` });
   });
 
   return proc;
