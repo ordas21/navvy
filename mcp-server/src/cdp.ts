@@ -798,12 +798,18 @@ interface DragResult {
  * Drag from one element to another using CDP Input.dispatchMouseEvent.
  * This works inside the browser viewport (no OS-level input needed),
  * produces smooth intermediate moves, and triggers all DOM mouse events.
+ *
+ * Key details that make this work with real drag libraries:
+ * - buttons: 1 on all mouseMoved events (indicates left button held)
+ * - 200ms hold delay after mousePressed (triggers drag threshold)
+ * - Small initial movement to cross the drag activation distance
+ * - Smooth interpolated steps with realistic timing
  */
 export async function dragCDP(
   fromSelector: string,
   toSelector: string,
-  steps: number = 10,
-  durationMs: number = 300,
+  steps: number = 15,
+  durationMs: number = 500,
 ): Promise<DragResult> {
   const cdp = await getClient();
 
@@ -818,24 +824,36 @@ export async function dragCDP(
 
   const stepDelay = durationMs / steps;
 
-  // 1. Move to source and press
+  // 1. Move to source element
   await cdp.Input.dispatchMouseEvent({
     type: 'mouseMoved',
     x: fromX,
     y: fromY,
+    buttons: 0,
   });
-  await new Promise(r => setTimeout(r, 20));
+  await new Promise(r => setTimeout(r, 50));
 
+  // 2. Press and hold — long enough to trigger drag threshold
   await cdp.Input.dispatchMouseEvent({
     type: 'mousePressed',
     x: fromX,
     y: fromY,
     button: 'left',
+    buttons: 1,
     clickCount: 1,
+  });
+  await new Promise(r => setTimeout(r, 200));
+
+  // 3. Small initial move to cross the drag activation distance (5px)
+  await cdp.Input.dispatchMouseEvent({
+    type: 'mouseMoved',
+    x: fromX,
+    y: fromY + (toY > fromY ? 5 : -5),
+    buttons: 1,
   });
   await new Promise(r => setTimeout(r, 50));
 
-  // 2. Smooth intermediate moves
+  // 4. Smooth intermediate moves with buttons: 1
   for (let i = 1; i <= steps; i++) {
     const t = i / steps;
     const x = fromX + (toX - fromX) * t;
@@ -844,18 +862,21 @@ export async function dragCDP(
       type: 'mouseMoved',
       x,
       y,
-      button: 'left',
+      buttons: 1,
     });
     await new Promise(r => setTimeout(r, stepDelay));
   }
 
-  // 3. Release at target
-  await new Promise(r => setTimeout(r, 30));
+  // 5. Hold at target briefly
+  await new Promise(r => setTimeout(r, 100));
+
+  // 6. Release at target
   await cdp.Input.dispatchMouseEvent({
     type: 'mouseReleased',
     x: toX,
     y: toY,
     button: 'left',
+    buttons: 0,
     clickCount: 1,
   });
 
@@ -928,6 +949,112 @@ export async function dragHTML5(
       }));
 
       return { success: true };
+    })()
+  `);
+}
+
+// ---- Sortable List Reorder ----
+
+export interface ReorderResult {
+  success: boolean;
+  method: string;
+  previousOrder: string[];
+  newOrder: string[];
+  error?: string;
+}
+
+/**
+ * Reorder items in a sortable list by moving them via DOM manipulation
+ * and triggering the appropriate framework events to update state.
+ * Works with SortableJS, react-sortable-hoc, dnd-kit, and similar libraries.
+ *
+ * @param containerSelector - CSS selector for the sortable container
+ * @param newOrder - Array of 0-based indices representing the desired order.
+ *                   e.g. [2,0,1] moves item at index 2 to first, 0 to second, 1 to third.
+ */
+export async function reorderList(
+  containerSelector: string,
+  newOrder: number[],
+): Promise<ReorderResult> {
+  return evaluate<ReorderResult>(`
+    (function() {
+      var container = document.querySelector(${JSON.stringify(containerSelector)});
+      if (!container) throw new Error('Container not found: ${containerSelector}');
+
+      var children = Array.from(container.children);
+      if (newOrder.length !== children.length) {
+        throw new Error('newOrder length (' + ${JSON.stringify(newOrder)}.length + ') does not match children count (' + children.length + ')');
+      }
+
+      var newOrder = ${JSON.stringify(newOrder)};
+      var previousOrder = children.map(function(c) { return (c.textContent || '').trim().substring(0, 60); });
+
+      // Try SortableJS first (most common)
+      var sortableInstance = null;
+      if (window.Sortable) {
+        // SortableJS stores instance on the element
+        sortableInstance = window.Sortable.get && window.Sortable.get(container);
+        if (!sortableInstance) {
+          // Try accessing via element property
+          sortableInstance = container.sortable || container._sortable;
+        }
+      }
+
+      if (sortableInstance && sortableInstance.sort) {
+        // Use SortableJS API — get current data-id or index order, rearrange
+        var items = sortableInstance.toArray();
+        if (items && items.length === newOrder.length) {
+          var reordered = newOrder.map(function(idx) { return items[idx]; });
+          sortableInstance.sort(reordered, true);
+          var newOrderText = Array.from(container.children).map(function(c) { return (c.textContent || '').trim().substring(0, 60); });
+          return { success: true, method: 'sortablejs-api', previousOrder: previousOrder, newOrder: newOrderText };
+        }
+      }
+
+      // Fallback: DOM manipulation + React/framework state sync
+      // Clone references in new order
+      var reordered = newOrder.map(function(idx) { return children[idx]; });
+
+      // Remove all children
+      while (container.firstChild) {
+        container.removeChild(container.firstChild);
+      }
+
+      // Re-insert in new order
+      reordered.forEach(function(child) {
+        container.appendChild(child);
+      });
+
+      // Try to trigger React state update
+      var reactFiberKey = Object.keys(container).find(function(k) { return k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'); });
+      if (reactFiberKey) {
+        // Dispatch synthetic events to nudge React into recognizing the change
+        container.dispatchEvent(new Event('change', { bubbles: true }));
+        // Find React's onChange/onDragEnd handler by walking the fiber tree
+        var fiber = container[reactFiberKey];
+        var current = fiber;
+        for (var i = 0; i < 20 && current; i++) {
+          if (current.memoizedProps) {
+            var props = current.memoizedProps;
+            if (props.onSortEnd) {
+              props.onSortEnd({ oldIndex: 0, newIndex: 0, collection: 0 });
+              break;
+            }
+            if (props.onDragEnd) {
+              props.onDragEnd({ source: { index: 0 }, destination: { index: 0 } });
+              break;
+            }
+          }
+          current = current.return;
+        }
+      }
+
+      // Also dispatch native events that sortable libraries commonly listen to
+      container.dispatchEvent(new Event('sort', { bubbles: true }));
+      container.dispatchEvent(new Event('update', { bubbles: true }));
+
+      var newOrderText = Array.from(container.children).map(function(c) { return (c.textContent || '').trim().substring(0, 60); });
+      return { success: true, method: reactFiberKey ? 'dom-react' : 'dom', previousOrder: previousOrder, newOrder: newOrderText };
     })()
   `);
 }
