@@ -1,7 +1,15 @@
 /* global chrome, loadConversationIndex, loadConversation, appendToConversation,
    createConversation, deleteConversation, updateConversationIndex,
    getActiveConversationId, setActiveConversationId, checkStorageUsage,
-   flushAllPendingAppends */
+   flushAllPendingAppends, marked, DOMPurify */
+
+// ---- Markdown rendering ----
+marked.setOptions({ breaks: true, gfm: true });
+
+function renderMarkdown(text) {
+  const html = marked.parse(text);
+  return DOMPurify.sanitize(html);
+}
 
 const DEFAULT_SERVER_URL = 'ws://localhost:3300/ws';
 
@@ -48,6 +56,9 @@ const btnNewConversation = document.getElementById('btn-new-conversation');
 const btnConversationsClose = document.getElementById('btn-conversations-close');
 
 // ---- Tool Labels ----
+// Pending approval state
+let pendingApproval = null;
+
 const TOOL_LABELS = {
   browser_screenshot: 'Screenshot',
   browser_get_dom: 'Get DOM',
@@ -80,6 +91,27 @@ const TOOL_LABELS = {
   browser_right_click: 'Right Click',
   browser_drag: 'Drag',
   browser_reorder: 'Reorder List',
+  browser_new_tab: 'New Tab',
+  browser_close_tab: 'Close Tab',
+  browser_extract_from_tab: 'Extract from Tab',
+  browser_compare_tabs: 'Compare Tabs',
+  browser_solve_captcha: 'Solve CAPTCHA',
+  credential_lookup: 'Credential Lookup',
+  macro_create: 'Create Macro',
+  macro_list: 'List Macros',
+  macro_delete: 'Delete Macro',
+  macro_run: 'Run Macro',
+  schedule_create: 'Create Schedule',
+  schedule_list: 'List Schedules',
+  schedule_pause: 'Pause Schedule',
+  schedule_resume: 'Resume Schedule',
+  schedule_delete: 'Delete Schedule',
+  schedule_history: 'Schedule History',
+  workflow_record_start: 'Start Recording',
+  workflow_record_stop: 'Stop Recording',
+  workflow_list: 'List Workflows',
+  workflow_run: 'Run Workflow',
+  workflow_delete: 'Delete Workflow',
 };
 
 function formatToolName(raw) {
@@ -230,7 +262,7 @@ function renderAssistantMessage(text) {
   el.className = 'message assistant';
   const content = document.createElement('div');
   content.className = 'msg-content';
-  content.textContent = text;
+  content.innerHTML = renderMarkdown(text);
   el.appendChild(content);
   messagesEl.appendChild(el);
   return el;
@@ -658,6 +690,21 @@ function handleServerMessage(msg) {
       }
       break;
 
+    case 'approval_request':
+      showApprovalDialog(msg.approval);
+      break;
+
+    case 'checkpoint_created':
+      // Silent — checkpoints are auto-created
+      break;
+
+    case 'scheduled_task_update':
+      // Could show a toast notification
+      if (msg.scheduledTask) {
+        showConnectionToast('connected', `Task "${msg.scheduledTask.name}": ${msg.scheduledTask.status}`);
+      }
+      break;
+
     case 'pong':
       break;
   }
@@ -688,7 +735,7 @@ function appendTextDelta(text) {
     messagesEl.appendChild(currentTextEl);
   }
   const content = currentTextEl.querySelector('.msg-content');
-  content.textContent += text;
+  content.innerHTML = renderMarkdown(currentTextBuffer);
   scrollToBottom();
 }
 
@@ -1360,6 +1407,65 @@ setInterval(() => {
     ws.send(JSON.stringify({ type: 'ping', sessionId }));
   }
 }, 30000);
+
+// ---- Approval Dialog ----
+
+const approvalOverlay = document.getElementById('approval-overlay');
+const approvalBadge = document.getElementById('approval-badge');
+const approvalToolName = document.getElementById('approval-tool-name');
+const approvalReason = document.getElementById('approval-reason');
+const approvalInput = document.getElementById('approval-input');
+const btnApprovalDeny = document.getElementById('btn-approval-deny');
+const btnApprovalApprove = document.getElementById('btn-approval-approve');
+const btnApprovalAlways = document.getElementById('btn-approval-always');
+
+function showApprovalDialog(approval) {
+  if (!approval) return;
+  pendingApproval = approval;
+
+  approvalBadge.textContent = (approval.trustLevel || 'DANGEROUS').toUpperCase();
+  approvalBadge.className = 'trust-badge ' + (approval.trustLevel || 'dangerous');
+  approvalToolName.textContent = formatToolName(approval.toolName);
+  approvalReason.textContent = approval.reason || 'Action requires approval';
+
+  try {
+    approvalInput.textContent = JSON.stringify(JSON.parse(approval.toolInput), null, 2);
+  } catch {
+    approvalInput.textContent = approval.toolInput || '';
+  }
+
+  approvalOverlay.style.display = 'flex';
+}
+
+function sendApprovalResponse(response) {
+  if (!pendingApproval || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+  ws.send(JSON.stringify({
+    type: 'approval_response',
+    sessionId: sessionId,
+    approvalId: pendingApproval.id,
+    approvalResponse: response,
+    toolName: pendingApproval.toolName,
+  }));
+
+  pendingApproval = null;
+  approvalOverlay.style.display = 'none';
+}
+
+if (btnApprovalDeny) {
+  btnApprovalDeny.addEventListener('click', () => sendApprovalResponse('deny'));
+}
+if (btnApprovalApprove) {
+  btnApprovalApprove.addEventListener('click', () => sendApprovalResponse('approve'));
+}
+if (btnApprovalAlways) {
+  btnApprovalAlways.addEventListener('click', () => sendApprovalResponse('approve_always'));
+}
+if (approvalOverlay) {
+  approvalOverlay.addEventListener('click', (e) => {
+    if (e.target === approvalOverlay) sendApprovalResponse('deny');
+  });
+}
 
 // Start
 boot();

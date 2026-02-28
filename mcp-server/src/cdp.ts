@@ -4,6 +4,10 @@ import { generatePath, computeDelays, type TimedPoint } from './motion.js';
 let client: CDP.Client | null = null;
 let currentTargetId: string | null = null;
 
+// Multi-tab support: cache clients by tab ID
+const tabClients = new Map<string, CDP.Client>();
+let activeTabId: string | null = null;
+
 // ---- Network capture state ----
 interface CapturedRequest {
   requestId: string;
@@ -246,6 +250,70 @@ export async function switchTab(tabId: string): Promise<void> {
   await client.Runtime.enable();
   await client.DOM.enable();
   await client.Network.enable();
+  activeTabId = tabId;
+  currentTargetId = tabId;
+}
+
+// ---- Multi-Tab Operations ----
+
+export async function getClientForTab(tabId: string): Promise<CDP.Client> {
+  // Check if we already have a cached client for this tab
+  const cached = tabClients.get(tabId);
+  if (cached) {
+    try {
+      await cached.Browser.getVersion();
+      return cached;
+    } catch {
+      tabClients.delete(tabId);
+    }
+  }
+
+  // Create a new client for this tab
+  const tabClient = await CDP({ port: 9222, target: tabId });
+  await tabClient.Page.enable();
+  await tabClient.Runtime.enable();
+  tabClients.set(tabId, tabClient);
+  return tabClient;
+}
+
+export async function createTab(url?: string): Promise<string> {
+  const targetUrl = url || 'about:blank';
+  const response = await fetch(`http://localhost:9222/json/new?${encodeURIComponent(targetUrl)}`);
+  const target = await response.json() as { id: string };
+  return target.id;
+}
+
+export async function closeTab(tabId: string): Promise<void> {
+  // Close cached client if any
+  const cached = tabClients.get(tabId);
+  if (cached) {
+    try { await cached.close(); } catch { /* ignore */ }
+    tabClients.delete(tabId);
+  }
+  // If this was the active tab, clear the active client
+  if (tabId === currentTargetId) {
+    client = null;
+    currentTargetId = null;
+    activeTabId = null;
+  }
+  await fetch(`http://localhost:9222/json/close/${tabId}`);
+}
+
+export async function evaluateInTab<T = unknown>(tabId: string, expression: string): Promise<T> {
+  const tabClient = await getClientForTab(tabId);
+  const result = await tabClient.Runtime.evaluate({
+    expression,
+    returnByValue: true,
+    awaitPromise: true,
+  });
+  if (result.exceptionDetails) {
+    throw new Error(
+      result.exceptionDetails.text ||
+      result.exceptionDetails.exception?.description ||
+      'Evaluation failed'
+    );
+  }
+  return result.result.value as T;
 }
 
 export async function scrollPage(direction: 'up' | 'down', amount: number = 500): Promise<void> {

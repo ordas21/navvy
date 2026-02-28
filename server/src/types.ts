@@ -3,11 +3,17 @@
 export type Mode = 'auto' | 'screenshot' | 'dom' | 'accessibility' | 'network' | 'console';
 
 export interface ClientMessage {
-  type: 'prompt' | 'cancel' | 'ping';
+  type: 'prompt' | 'cancel' | 'ping' | 'approval_response' | 'checkpoint_resume';
   sessionId: string;
   prompt?: string;
   attachments?: Attachment[];
   mode?: Mode;
+  // Approval response fields
+  approvalId?: string;
+  approvalResponse?: 'approve' | 'deny' | 'approve_always';
+  toolName?: string;
+  // Checkpoint resume fields
+  checkpointId?: string;
 }
 
 export interface Attachment {
@@ -16,6 +22,14 @@ export interface Attachment {
   mimeType: string;
   /** base64 data for files, or text content for page context */
   data: string;
+}
+
+export interface ApprovalRequestData {
+  id: string;
+  toolName: string;
+  toolInput: string;
+  trustLevel: string;
+  reason: string;
 }
 
 export interface ServerMessage {
@@ -31,7 +45,10 @@ export interface ServerMessage {
     | 'error'
     | 'status'
     | 'cost'
-    | 'pong';
+    | 'pong'
+    | 'approval_request'
+    | 'checkpoint_created'
+    | 'scheduled_task_update';
   sessionId: string;
   text?: string;
   thinking?: string;
@@ -42,6 +59,9 @@ export interface ServerMessage {
   error?: string;
   status?: string;
   cost?: CostInfo;
+  approval?: ApprovalRequestData;
+  checkpoint?: { id: string; stepIndex: number; description: string };
+  scheduledTask?: { id: string; name: string; status: string; lastResult?: string };
 }
 
 export interface CostInfo {

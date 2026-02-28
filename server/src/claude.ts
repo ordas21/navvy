@@ -2,8 +2,18 @@ import { spawn, execSync, ChildProcess } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { v4 as uuidv4 } from 'uuid';
 import type { ServerMessage, CostInfo, Mode } from './types.js';
 import { SessionTracker, finalizeSession, getLearningsForPrompt, extractHostname, SELF_REVIEW_PROMPT } from './learnings.js';
+import { addCheckpoint, createCheckpointSession } from './checkpoints.js';
+import { isRecording, recordAction } from './workflows.js';
+
+// Maps navvy conversation IDs (from extension) to Claude CLI session UUIDs
+const claudeSessionMap = new Map<string, string>();
+
+export function clearClaudeSession(navvySessionId: string): void {
+  claudeSessionMap.delete(navvySessionId);
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
@@ -65,6 +75,60 @@ That's 3-4 tool calls total. NOT one per field.
 - browser_evaluate: run JavaScript
 - browser_key_press: press keyboard keys
 
+## System Tools
+You also have access to system-level tools that run directly on the user's computer:
+- system_shell: Execute shell commands (bash). Use for complex operations, piped commands, package installs, git.
+- system_read_file / system_write_file: Read/write files. Prefer these over shell cat/echo.
+- system_list_directory: List directory contents. Prefer over shell ls.
+- system_search_files / system_search_content: Find files or search contents. Prefer over shell find/grep.
+- system_processes / system_kill_process: View and manage running processes.
+- system_info: Get OS, CPU, memory, disk information.
+- system_clipboard_read / system_clipboard_write: Read/write system clipboard.
+
+Prefer dedicated file tools over system_shell for simple operations.
+Use system_shell for complex multi-step operations, piped commands, and anything not covered by dedicated tools.
+
+## Computer Control (macOS)
+You can see and control ANY application on the screen, not just the browser:
+- system_screenshot: Capture full screen or a specific app's window. Returns base64 PNG.
+- system_accessibility_tree: Get UI element tree of any app — roles, labels, positions, sizes, values. Like DOM for the OS.
+- system_click_at: Click at absolute screen coordinates (left, right, or double click).
+- system_type_text: Type text in any focused application.
+- system_key_press: Press keys or key combinations (e.g., cmd+c, cmd+tab).
+- system_applescript: Run AppleScript or JXA for high-level app automation.
+- system_open_app: Open, activate, or quit applications.
+- system_move_mouse: Smooth Bezier-eased mouse movement.
+- system_drag: Drag from point A to B with smooth motion.
+- system_scroll_at: Native scroll wheel at screen coordinates.
+
+### Computer Control Workflow
+1. system_open_app to launch/activate the target app
+2. system_accessibility_tree to get structured UI elements with positions, OR system_screenshot for visual context
+3. system_click_at / system_type_text / system_key_press to interact using coordinates from the tree
+4. system_screenshot to verify results
+
+Prefer system_accessibility_tree over screenshots for finding element positions.
+Prefer system_applescript for high-level operations over clicking through menus.
+
+## Multi-Tab
+- browser_new_tab: Open a new browser tab (optionally with a URL). Returns tabId.
+- browser_close_tab: Close a browser tab by tabId.
+- browser_extract_from_tab: Run JS in a specific tab without switching the active tab.
+- browser_compare_tabs: Compare data across multiple tabs by running the same JS expression in each.
+
+## Workflows & Automation
+- workflow_record_start / workflow_record_stop: Record your actions as a replayable workflow.
+- workflow_list / workflow_run / workflow_delete: Manage saved workflows. workflow_run accepts variables for parameterized replay.
+- schedule_create: Create a recurring or one-time scheduled task. Parse natural language: "every hour", "every Monday at 9am", "in 30 minutes".
+- schedule_list / schedule_pause / schedule_resume / schedule_delete / schedule_history: Manage scheduled tasks.
+- macro_create / macro_list / macro_delete / macro_run: Create named shortcuts for common multi-step operations.
+
+## Security & Credentials
+- credential_lookup: Get a secure reference token for a password manager credential. NEVER type passwords directly — always use credential references.
+- browser_solve_captcha: Detect and solve CAPTCHAs on the current page (reCAPTCHA, hCaptcha, Turnstile, image).
+
+Dangerous actions (purchases, deletions, git push) may require user approval. If an action is denied, do not retry — ask the user for guidance.
+
 ## Error Recovery
 - If an action fails, use browser_inspect_page to understand current state
 - Try a different selector or approach — don't repeat the same failed action
@@ -72,14 +136,8 @@ That's 3-4 tool calls total. NOT one per field.
 
 const MODE_PROMPTS: Record<Mode, string> = {
   auto: `## Mode: Auto
-Your first action should ALWAYS be browser_inspect_page. Never start with a screenshot or scrolling.
-
-Act immediately on inspect results — do not scroll to explore the page first. browser_inspect_page already tells you about ALL elements including off-screen ones.
-
-For forms/quizzes: inspect_page → fill_form (all fields at once) → click submit. That's it. 3 calls.
-
-Use screenshots only for visual verification after actions, not for initial page understanding.
-Use browser_get_dom only when inspect_page doesn't give you enough info about non-interactive HTML structure.
+Follow the Core Workflow and Critical Rules above strictly. Be concise in your responses — act, don't explain.
+Use browser_get_dom only when inspect_page doesn't give enough detail about non-interactive HTML.
 Use browser_get_accessibility_tree for complex widgets (tabs, dialogs, menus).
 Use browser_network/console tools for debugging API calls or JS errors.`,
 
@@ -135,27 +193,49 @@ function buildSystemPrompt(mode: Mode, hostname?: string): string {
   return prompt;
 }
 
-export function runClaude(prompt: string, mode: Mode, onMessage: OnMessage): ChildProcess {
-  const sessionId = `session-${Date.now()}`;
+export function runClaude(prompt: string, mode: Mode, navvySessionId: string, onMessage: OnMessage): ChildProcess {
   const hostname = extractHostname(prompt);
-  const systemPrompt = buildSystemPrompt(mode, hostname);
+  const isFollowUp = claudeSessionMap.has(navvySessionId);
+
+  let claudeUUID: string;
+  if (isFollowUp) {
+    claudeUUID = claudeSessionMap.get(navvySessionId)!;
+  } else {
+    claudeUUID = uuidv4();
+    claudeSessionMap.set(navvySessionId, claudeUUID);
+  }
 
   // Create session tracker for the learnings system
-  const tracker = new SessionTracker(sessionId, mode, prompt);
+  const tracker = new SessionTracker(claudeUUID, mode, prompt);
 
-  const args = [
-    '-p', `${systemPrompt}\n\nUser task: ${prompt}`,
+  // Create checkpoint session
+  createCheckpointSession(navvySessionId, prompt);
+  let turnIndex = 0;
+  const recentActions: Array<{ tool: string; input: string; result: string; ts: number }> = [];
+  let lastUrl = '';
+  let lastPageTitle = '';
+
+  const sharedArgs = [
     '--output-format', 'stream-json',
     '--include-partial-messages',
     '--verbose',
     '--mcp-config', MCP_CONFIG,
     '--allowedTools', 'mcp__browser__*',
-    '--max-turns', '50',
     '--model', 'sonnet',
     '--dangerously-skip-permissions',
   ];
 
-  console.log('[claude] Spawning with args:', args.join(' '));
+  let args: string[];
+  if (isFollowUp) {
+    // Follow-up: resume existing session, just send user message
+    args = ['-p', prompt, '--resume', claudeUUID, ...sharedArgs];
+  } else {
+    // First turn: full system prompt + new session ID
+    const systemPrompt = buildSystemPrompt(mode, hostname);
+    args = ['-p', prompt, '--system-prompt', systemPrompt, '--session-id', claudeUUID, ...sharedArgs];
+  }
+
+  console.log(`[claude] ${isFollowUp ? 'Resuming' : 'Starting'} session ${claudeUUID} (navvy: ${navvySessionId})`);
 
   // Strip env vars that prevent the CLI from running
   const env = { ...process.env };
@@ -190,6 +270,30 @@ export function runClaude(prompt: string, mode: Mode, onMessage: OnMessage): Chi
       case 'tool_result':
         if (msg.toolId && msg.toolResult) {
           tracker.addToolResult(msg.toolId, msg.toolResult);
+
+          // Track recent actions for checkpointing
+          const toolCall = tracker.getData().toolCalls.find(tc => tc.toolId === msg.toolId);
+          if (toolCall) {
+            recentActions.push({
+              tool: toolCall.toolName,
+              input: toolCall.input,
+              result: msg.toolResult.substring(0, 500),
+              ts: Date.now(),
+            });
+
+            // Record action for workflow recording
+            if (isRecording(navvySessionId)) {
+              recordAction(navvySessionId, toolCall.toolName, toolCall.input, msg.toolResult);
+            }
+
+            // Extract URL/title from navigate or inspect results
+            if (toolCall.toolName.includes('navigate') || toolCall.toolName.includes('inspect')) {
+              const urlMatch = msg.toolResult.match(/URL:\s*(\S+)/);
+              if (urlMatch) lastUrl = urlMatch[1];
+              const titleMatch = msg.toolResult.match(/Title:\s*(.+)/);
+              if (titleMatch) lastPageTitle = titleMatch[1].trim();
+            }
+          }
         }
         break;
       case 'text_delta':
@@ -203,6 +307,23 @@ export function runClaude(prompt: string, mode: Mode, onMessage: OnMessage): Chi
         }
         break;
       case 'done':
+        // Auto-checkpoint on turn completion
+        try {
+          if (recentActions.length > 0) {
+            const lastAction = recentActions[recentActions.length - 1];
+            addCheckpoint(navvySessionId, {
+              stepIndex: turnIndex++,
+              timestamp: Date.now(),
+              description: `Turn ${turnIndex}: ${recentActions.map(a => a.tool.replace(/^mcp__browser__/, '')).join(', ')}`,
+              stateSnapshot: { url: lastUrl, pageTitle: lastPageTitle },
+              actionLog: recentActions.splice(0),
+              status: 'completed',
+            });
+          }
+        } catch (err) {
+          console.error('[checkpoints] Failed to add checkpoint:', err);
+        }
+
         // Finalize session and persist learnings
         try {
           finalizeSession(tracker);
@@ -261,6 +382,11 @@ export function runClaude(prompt: string, mode: Mode, onMessage: OnMessage): Chi
     if (code !== 0) {
       const errMsg = stderrBuffer.trim() || `Claude exited with code ${code}`;
       trackedOnMessage({ type: 'error', error: errMsg });
+      // If resume failed, clear mapping so next attempt starts fresh
+      if (isFollowUp) {
+        console.log(`[claude] Clearing session mapping for ${navvySessionId} after error`);
+        claudeSessionMap.delete(navvySessionId);
+      }
     }
     if (!hasOutput) {
       console.log('[claude] WARNING: Process exited with no stdout output');

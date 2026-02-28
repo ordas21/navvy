@@ -4,6 +4,10 @@ import * as cdp from './cdp.js';
 import * as input from './input.js';
 import { elementToScreenCoords, pageToScreenCoords } from './coordinates.js';
 import { generateSplinePath } from './motion.js';
+import { isCredentialToken, resolveCredentialRef, createCredentialRef } from './credentials.js';
+import { requestApproval, checkNeedsApproval } from './approval-gate.js';
+import { detectCaptcha, solveCaptcha, injectCaptchaSolution } from './captcha.js';
+import type { CaptchaType } from './captcha.js';
 
 export function registerTools(server: McpServer): void {
 
@@ -47,6 +51,14 @@ export function registerTools(server: McpServer): void {
     'Click an element on the page using a CSS selector. Uses native OS-level mouse input.',
     { selector: z.string().describe('CSS selector of the element to click') },
     async ({ selector }) => {
+      // Check if this click needs approval (e.g., purchase buttons)
+      const approvalCheck = checkNeedsApproval('browser_click', selector);
+      if (approvalCheck) {
+        const approved = await requestApproval('browser_click', JSON.stringify({ selector }));
+        if (!approved) {
+          return { content: [{ type: 'text', text: `Action denied by user: clicking "${selector}"` }], isError: true };
+        }
+      }
       const coords = await elementToScreenCoords(selector);
       await input.click(coords.x, coords.y);
       // Small delay to let the page react
@@ -434,6 +446,16 @@ export function registerTools(server: McpServer): void {
       })).describe('Array of form fill actions'),
     },
     async ({ actions }) => {
+      // Resolve credential tokens before filling
+      for (const action of actions) {
+        if (action.value && isCredentialToken(action.value)) {
+          try {
+            action.value = await resolveCredentialRef(action.value);
+          } catch (err) {
+            return { content: [{ type: 'text' as const, text: `Failed to resolve credential: ${(err as Error).message}` }], isError: true };
+          }
+        }
+      }
       const result = await cdp.fillForm(actions);
       const lines = [`Filled ${result.succeeded}/${result.total} fields`];
       for (const r of result.results) {
@@ -615,6 +637,154 @@ Example: to move the 3rd item to position 1 in a 4-item list, use newOrder: [0, 
       } else {
         return { content: [{ type: 'text', text: `Reorder failed: ${result.error ?? 'unknown error'}` }], isError: true };
       }
+    }
+  );
+
+  // ---- Multi-Tab Tools ----
+
+  server.tool(
+    'browser_new_tab',
+    'Open a new browser tab, optionally navigating to a URL. Returns the tab ID.',
+    {
+      url: z.string().optional().describe('URL to open in the new tab'),
+    },
+    async ({ url }) => {
+      const tabId = await cdp.createTab(url);
+      // Wait for the page to load
+      await new Promise(r => setTimeout(r, 1000));
+      let info = { url: url || 'about:blank', title: '' };
+      try {
+        const tabClient = await cdp.getClientForTab(tabId);
+        const result = await tabClient.Runtime.evaluate({ expression: 'JSON.stringify({url: window.location.href, title: document.title})', returnByValue: true, awaitPromise: true });
+        info = JSON.parse(result.result.value as string);
+      } catch { /* ignore */ }
+      return { content: [{ type: 'text', text: `Opened new tab: ${tabId}\nURL: ${info.url}\nTitle: ${info.title}` }] };
+    }
+  );
+
+  server.tool(
+    'browser_close_tab',
+    'Close a browser tab by its tab ID.',
+    {
+      tabId: z.string().describe('Tab ID to close (from browser_tabs or browser_new_tab)'),
+    },
+    async ({ tabId }) => {
+      await cdp.closeTab(tabId);
+      return { content: [{ type: 'text', text: `Closed tab: ${tabId}` }] };
+    }
+  );
+
+  server.tool(
+    'browser_extract_from_tab',
+    'Run a JavaScript expression in a specific tab without switching the active tab. Useful for extracting data from background tabs.',
+    {
+      tabId: z.string().describe('Tab ID to extract data from'),
+      expression: z.string().describe('JavaScript expression to evaluate'),
+    },
+    async ({ tabId, expression }) => {
+      const result = await cdp.evaluateInTab(tabId, expression);
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  server.tool(
+    'browser_compare_tabs',
+    'Run the same JavaScript expression in multiple tabs and return the results side by side. Useful for comparing prices, data, etc.',
+    {
+      tabIds: z.array(z.string()).min(2).describe('Array of tab IDs to compare'),
+      expression: z.string().describe('JavaScript expression to evaluate in each tab'),
+      label: z.string().optional().describe('Label for the comparison'),
+    },
+    async ({ tabIds, expression, label }) => {
+      const results: Array<{ tabId: string; result: unknown; error?: string }> = [];
+
+      for (const tabId of tabIds) {
+        try {
+          const result = await cdp.evaluateInTab(tabId, expression);
+          results.push({ tabId, result });
+        } catch (err) {
+          results.push({ tabId, result: null, error: (err as Error).message });
+        }
+      }
+
+      const lines = [label ? `## ${label}` : '## Tab Comparison'];
+      for (const r of results) {
+        lines.push(`\n### Tab ${r.tabId}`);
+        if (r.error) {
+          lines.push(`Error: ${r.error}`);
+        } else {
+          lines.push(JSON.stringify(r.result, null, 2));
+        }
+      }
+
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+  );
+
+  // ---- CAPTCHA Tool ----
+
+  server.tool(
+    'browser_solve_captcha',
+    'Detect and solve a CAPTCHA on the current page. Supports reCAPTCHA v2/v3, hCaptcha, Cloudflare Turnstile, and image CAPTCHAs. Requires CAPSOLVER_API_KEY or TWOCAPTCHA_API_KEY environment variable.',
+    {
+      type: z.enum(['recaptcha_v2', 'recaptcha_v3', 'hcaptcha', 'image', 'turnstile', 'auto']).optional().describe('CAPTCHA type (default: auto-detect)'),
+      siteKey: z.string().optional().describe('Site key (auto-detected from page if not provided)'),
+    },
+    async ({ type, siteKey }) => {
+      let captchaType: CaptchaType;
+      let resolvedSiteKey = siteKey;
+
+      if (!type || type === 'auto') {
+        // Auto-detect
+        const detected = await detectCaptcha();
+        if (!detected) {
+          return { content: [{ type: 'text', text: 'No CAPTCHA detected on this page.' }] };
+        }
+        captchaType = detected.type;
+        if (!resolvedSiteKey) resolvedSiteKey = detected.siteKey ?? undefined;
+      } else {
+        captchaType = type;
+      }
+
+      // Get page URL
+      const pageInfo = await cdp.getPageInfo();
+
+      try {
+        const solution = await solveCaptcha({
+          type: captchaType,
+          siteKey: resolvedSiteKey,
+          pageUrl: pageInfo.url,
+        });
+
+        // Inject the solution
+        await injectCaptchaSolution(captchaType, solution);
+
+        return { content: [{ type: 'text', text: `CAPTCHA solved (${captchaType}). Solution injected into the page.` }] };
+      } catch (err) {
+        return { content: [{ type: 'text', text: `Failed to solve CAPTCHA: ${(err as Error).message}` }], isError: true };
+      }
+    }
+  );
+
+  // ---- Credential Tool ----
+
+  server.tool(
+    'credential_lookup',
+    'Get a secure reference token for a credential from a password manager. The token can be used in browser_fill_form — the actual password is NEVER exposed in the conversation. Supported providers: 1password, bitwarden, env (environment variables), keychain (macOS).',
+    {
+      provider: z.enum(['1password', 'bitwarden', 'env', 'keychain']).describe('Credential provider'),
+      lookupKey: z.string().describe('Item name/identifier to look up (e.g., "GitHub Login", "MY_API_KEY")'),
+      field: z.string().optional().describe('Field to retrieve (default: "password"). Options: password, username, email, or custom field name.'),
+    },
+    async ({ provider, lookupKey, field }) => {
+      const resolvedField = field || 'password';
+      const token = createCredentialRef(provider, lookupKey, resolvedField);
+      return {
+        content: [{
+          type: 'text',
+          text: `Credential reference created: ${token}\nProvider: ${provider}\nItem: ${lookupKey}\nField: ${resolvedField}\n\nUse this token as the value in browser_fill_form. The actual credential will be resolved securely at fill time.`,
+        }],
+      };
     }
   );
 }

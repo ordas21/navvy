@@ -102,6 +102,35 @@
       <div id="slash-popup-list"></div>
     </div>
 
+    <!-- Approval dialog overlay -->
+    <div id="approval-overlay" style="display:none">
+      <div id="approval-panel">
+        <div id="approval-header">
+          <span id="approval-badge" class="trust-badge">DANGEROUS</span>
+          <h3>Approval Required</h3>
+        </div>
+        <div id="approval-body">
+          <div id="approval-tool" class="approval-field">
+            <label>Tool</label>
+            <span id="approval-tool-name"></span>
+          </div>
+          <div id="approval-reason-field" class="approval-field">
+            <label>Reason</label>
+            <span id="approval-reason"></span>
+          </div>
+          <div id="approval-input-field" class="approval-field">
+            <label>Details</label>
+            <pre id="approval-input"></pre>
+          </div>
+        </div>
+        <div id="approval-actions">
+          <button id="btn-approval-deny" class="approval-btn deny">Deny</button>
+          <button id="btn-approval-approve" class="approval-btn approve">Approve</button>
+          <button id="btn-approval-always" class="approval-btn always">Always Allow</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Settings overlay -->
     <div id="settings-overlay" style="display:none">
       <div id="settings-panel">
@@ -117,6 +146,8 @@
     </div>
   </div>
 
+  <script src="lib/marked.min.js"></script>
+  <script src="lib/purify.min.js"></script>
   <script src="storage.js"></script>
   <script src="sidepanel.js"></script>
 </body>
