@@ -1,11 +1,25 @@
 import CDP from 'chrome-remote-interface';
 import { generatePath, computeDelays, type TimedPoint } from './motion.js';
+import {
+  createProxyClient,
+  proxyListTabs,
+  proxyActivateTab,
+  proxyCreateTab,
+  proxyCloseTab,
+  proxyGetActiveTab,
+  type CDPProxyClient,
+} from './cdp-proxy.js';
 
-let client: CDP.Client | null = null;
+const CDP_MODE = process.env.NAVVY_CDP_MODE || 'extension';
+
+// CDPLikeClient: either a real CDP.Client or a proxy client from the extension
+type CDPLikeClient = CDP.Client | CDPProxyClient;
+
+let client: CDPLikeClient | null = null;
 let currentTargetId: string | null = null;
 
 // Multi-tab support: cache clients by tab ID
-const tabClients = new Map<string, CDP.Client>();
+const tabClients = new Map<string, CDPLikeClient>();
 let activeTabId: string | null = null;
 
 // ---- Network capture state ----
@@ -36,10 +50,21 @@ interface CapturedLog {
 const capturedLogs: CapturedLog[] = [];
 let consoleListenersAttached = false;
 
+/** Convert a tab ID string to a number (extension uses numeric Chrome tab IDs). */
+function tabIdToNumber(tabId: string): number {
+  const n = parseInt(tabId, 10);
+  if (isNaN(n)) throw new Error(`Invalid tab ID: ${tabId}`);
+  return n;
+}
+
 /**
  * Find the best page target — skip extensions, devtools, and internal pages.
  */
 async function findPageTarget(): Promise<string | undefined> {
+  if (CDP_MODE === 'extension') {
+    const tab = await proxyGetActiveTab();
+    return tab ? String(tab.id) : undefined;
+  }
   const response = await fetch('http://localhost:9222/json');
   const targets = await response.json() as Array<{ id: string; title: string; url: string; type: string }>;
   const page = targets.find(
@@ -52,11 +77,38 @@ async function findPageTarget(): Promise<string | undefined> {
   return page?.id;
 }
 
-export async function getClient(): Promise<CDP.Client> {
+export async function getClient(): Promise<CDPLikeClient> {
+  if (CDP_MODE === 'extension') {
+    if (client) {
+      try {
+        await (client as CDPProxyClient).Browser.getVersion();
+        return client;
+      } catch {
+        client = null;
+        currentTargetId = null;
+      }
+    }
+
+    const targetId = await findPageTarget();
+    if (!targetId) {
+      throw new Error('No browser tab found. Open a page in Chrome first.');
+    }
+
+    const proxyClient = createProxyClient(tabIdToNumber(targetId));
+    // Enable required domains
+    await proxyClient.Page.enable();
+    await proxyClient.Runtime.enable();
+    await proxyClient.DOM.enable();
+    await proxyClient.Network.enable();
+    client = proxyClient;
+    currentTargetId = targetId;
+    return client;
+  }
+
   if (client) {
     try {
       // Test if connection is still alive
-      await client.Browser.getVersion();
+      await (client as CDP.Client).Browser.getVersion();
       return client;
     } catch {
       client = null;
@@ -72,10 +124,10 @@ export async function getClient(): Promise<CDP.Client> {
   client = await CDP({ port: 9222, target: targetId });
   currentTargetId = targetId;
   // Enable required domains
-  await client.Page.enable();
-  await client.Runtime.enable();
-  await client.DOM.enable();
-  await client.Network.enable();
+  await (client as CDP.Client).Page.enable();
+  await (client as CDP.Client).Runtime.enable();
+  await (client as CDP.Client).DOM.enable();
+  await (client as CDP.Client).Network.enable();
   return client;
 }
 
@@ -229,6 +281,10 @@ export async function waitForSelector(selector: string, timeoutMs: number = 1000
 }
 
 export async function listTabs(): Promise<Array<{ id: string; title: string; url: string }>> {
+  if (CDP_MODE === 'extension') {
+    const tabs = await proxyListTabs();
+    return tabs.map(t => ({ id: String(t.id), title: t.title, url: t.url }));
+  }
   const response = await fetch('http://localhost:9222/json');
   const targets = await response.json() as Array<{ id: string; title: string; url: string; type: string }>;
   return targets
@@ -242,21 +298,38 @@ export async function listTabs(): Promise<Array<{ id: string; title: string; url
 }
 
 export async function switchTab(tabId: string): Promise<void> {
+  if (CDP_MODE === 'extension') {
+    const numId = tabIdToNumber(tabId);
+    await proxyActivateTab(numId);
+    // Create new proxy client for this tab
+    if (client) {
+      (client as CDPProxyClient).close();
+    }
+    const proxyClient = createProxyClient(numId);
+    await proxyClient.Page.enable();
+    await proxyClient.Runtime.enable();
+    await proxyClient.DOM.enable();
+    await proxyClient.Network.enable();
+    client = proxyClient;
+    activeTabId = tabId;
+    currentTargetId = tabId;
+    return;
+  }
   await fetch(`http://localhost:9222/json/activate/${tabId}`);
   // Reconnect CDP to the new target
   client = null;
   client = await CDP({ port: 9222, target: tabId });
-  await client.Page.enable();
-  await client.Runtime.enable();
-  await client.DOM.enable();
-  await client.Network.enable();
+  await (client as CDP.Client).Page.enable();
+  await (client as CDP.Client).Runtime.enable();
+  await (client as CDP.Client).DOM.enable();
+  await (client as CDP.Client).Network.enable();
   activeTabId = tabId;
   currentTargetId = tabId;
 }
 
 // ---- Multi-Tab Operations ----
 
-export async function getClientForTab(tabId: string): Promise<CDP.Client> {
+export async function getClientForTab(tabId: string): Promise<CDPLikeClient> {
   // Check if we already have a cached client for this tab
   const cached = tabClients.get(tabId);
   if (cached) {
@@ -268,6 +341,14 @@ export async function getClientForTab(tabId: string): Promise<CDP.Client> {
     }
   }
 
+  if (CDP_MODE === 'extension') {
+    const proxyClient = createProxyClient(tabIdToNumber(tabId));
+    await proxyClient.Page.enable();
+    await proxyClient.Runtime.enable();
+    tabClients.set(tabId, proxyClient);
+    return proxyClient;
+  }
+
   // Create a new client for this tab
   const tabClient = await CDP({ port: 9222, target: tabId });
   await tabClient.Page.enable();
@@ -277,6 +358,10 @@ export async function getClientForTab(tabId: string): Promise<CDP.Client> {
 }
 
 export async function createTab(url?: string): Promise<string> {
+  if (CDP_MODE === 'extension') {
+    const tabId = await proxyCreateTab(url);
+    return String(tabId);
+  }
   const targetUrl = url || 'about:blank';
   const response = await fetch(`http://localhost:9222/json/new?${encodeURIComponent(targetUrl)}`);
   const target = await response.json() as { id: string };
@@ -287,14 +372,21 @@ export async function closeTab(tabId: string): Promise<void> {
   // Close cached client if any
   const cached = tabClients.get(tabId);
   if (cached) {
-    try { await cached.close(); } catch { /* ignore */ }
+    try { cached.close(); } catch { /* ignore */ }
     tabClients.delete(tabId);
   }
   // If this was the active tab, clear the active client
   if (tabId === currentTargetId) {
+    if (client) {
+      try { client.close(); } catch { /* ignore */ }
+    }
     client = null;
     currentTargetId = null;
     activeTabId = null;
+  }
+  if (CDP_MODE === 'extension') {
+    await proxyCloseTab(tabIdToNumber(tabId));
+    return;
   }
   await fetch(`http://localhost:9222/json/close/${tabId}`);
 }
@@ -544,6 +636,13 @@ export interface InspectedElement {
   name?: string;
 }
 
+export interface ScrollableContainer {
+  selector: string;
+  scrollTop: number;
+  scrollHeight: number;
+  clientHeight: number;
+}
+
 export interface PageInspection {
   url: string;
   title: string;
@@ -551,15 +650,21 @@ export interface PageInspection {
   viewportHeight: number;
   scrollTop: number;
   scrollHeight: number;
+  scrollProgress: number;
+  moreContentBelow: boolean;
   focusedSelector?: string;
   hasDialog: boolean;
+  totalInteractiveElements: number;
   elements: InspectedElement[];
   forms: Array<{ selector: string; action?: string; method?: string; elementIndices: number[] }>;
+  scrollableContainers: ScrollableContainer[];
+  pagePatterns: string[];
 }
 
-export async function inspectPage(): Promise<PageInspection> {
+export async function inspectPage(maxElements: number = 500): Promise<PageInspection> {
   return evaluate<PageInspection>(`
     (function() {
+      var MAX = ${maxElements};
       var vw = window.innerWidth, vh = window.innerHeight;
 
       function bestSelector(el) {
@@ -624,8 +729,9 @@ export async function inspectPage(): Promise<PageInspection> {
         var style = window.getComputedStyle(el);
         return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
       });
-      // Cap at 100
-      allEls = allEls.slice(0, 100);
+
+      var totalInteractiveElements = allEls.length;
+      allEls = allEls.slice(0, MAX);
 
       var elements = allEls.map(function(el, i) {
         var tag = el.tagName.toLowerCase();
@@ -691,6 +797,55 @@ export async function inspectPage(): Promise<PageInspection> {
         try { focusedSelector = bestSelector(document.activeElement); } catch(e) {}
       }
 
+      // Detect scrollable containers
+      var scrollableContainers = [];
+      var candidates = document.querySelectorAll('*');
+      for (var i = 0; i < candidates.length && scrollableContainers.length < 10; i++) {
+        var c = candidates[i];
+        var st = window.getComputedStyle(c);
+        var overflowY = st.overflowY;
+        if ((overflowY === 'auto' || overflowY === 'scroll') && c.scrollHeight > c.clientHeight + 20) {
+          try {
+            scrollableContainers.push({
+              selector: bestSelector(c),
+              scrollTop: Math.round(c.scrollTop),
+              scrollHeight: c.scrollHeight,
+              clientHeight: c.clientHeight
+            });
+          } catch(e) {}
+        }
+      }
+
+      // Detect page patterns
+      var pagePatterns = [];
+      // Virtual scroll detection
+      if (document.querySelector('[style*="translateY"], [style*="translate3d"], .ReactVirtualized, [class*="virtual"], [class*="Virtual"]')) {
+        pagePatterns.push('virtual-scroll');
+      }
+      // Infinite scroll detection
+      if (document.querySelector('[class*="infinite"], [data-infinite], .infinite-scroll-component')) {
+        pagePatterns.push('infinite-scroll');
+      }
+      // Pagination detection
+      var paginationEl = document.querySelector('[class*="pagination"], [role="navigation"] a, .page-numbers, nav a[href*="page"]');
+      if (paginationEl) {
+        pagePatterns.push('pagination');
+      }
+      // Lazy loading detection
+      if (document.querySelector('[loading="lazy"], [data-src], .lazyload, img[class*="lazy"]')) {
+        pagePatterns.push('lazy-loading');
+      }
+      // "X of Y" text detection
+      var bodyText = document.body.innerText;
+      if (/\\d+\\s*(of|\\/)\\s*\\d+/.test(bodyText.substring(0, 5000))) {
+        pagePatterns.push('item-count');
+      }
+
+      // Scroll progress
+      var maxScroll = document.documentElement.scrollHeight - vh;
+      var scrollProgress = maxScroll > 0 ? Math.round((window.scrollY / maxScroll) * 100) : 100;
+      var moreContentBelow = window.scrollY + vh < document.documentElement.scrollHeight - 50;
+
       return {
         url: window.location.href,
         title: document.title,
@@ -698,10 +853,15 @@ export async function inspectPage(): Promise<PageInspection> {
         viewportHeight: vh,
         scrollTop: window.scrollY,
         scrollHeight: document.documentElement.scrollHeight,
+        scrollProgress: scrollProgress,
+        moreContentBelow: moreContentBelow,
         focusedSelector: focusedSelector,
         hasDialog: !!document.querySelector('dialog[open], [role="dialog"], [role="alertdialog"]'),
+        totalInteractiveElements: totalInteractiveElements,
         elements: elements,
-        forms: forms
+        forms: forms,
+        scrollableContainers: scrollableContainers,
+        pagePatterns: pagePatterns
       };
     })()
   `);
@@ -1204,9 +1364,502 @@ export async function reorderList(
   `);
 }
 
+// ---- Page Analysis ----
+
+export interface PageAnalysis {
+  pageType: 'table' | 'list' | 'grid' | 'feed' | 'form' | 'app' | 'unknown';
+  scrollInfo: {
+    windowScrollable: boolean;
+    scrollProgress: number;
+    scrollableContainers: Array<{
+      selector: string;
+      scrollProgress: number;
+      itemSelector?: string;
+      visibleItemCount: number;
+    }>;
+  };
+  contentPatterns: {
+    hasVirtualScroll: boolean;
+    hasInfiniteScroll: boolean;
+    hasPagination: boolean;
+    paginationInfo?: {
+      currentPage?: number;
+      totalPages?: number;
+      nextSelector?: string;
+    };
+    visibleItemCount: number;
+  };
+  networkPatterns: {
+    likelyUsesApiCalls: boolean;
+  };
+  recommendedStrategy: string;
+}
+
+export async function analyzePage(): Promise<PageAnalysis> {
+  return evaluate<PageAnalysis>(`
+    (function() {
+      var vh = window.innerHeight;
+      var vw = window.innerWidth;
+
+      // --- Page Type Detection ---
+      var pageType = 'unknown';
+      if (document.querySelector('table:not([role])') && document.querySelectorAll('table tr').length > 3) {
+        pageType = 'table';
+      } else if (document.querySelector('form') && document.querySelectorAll('input, select, textarea').length > 3) {
+        pageType = 'form';
+      } else if (document.querySelector('[class*="grid"], [style*="display: grid"], [style*="display:grid"]')) {
+        pageType = 'grid';
+      } else if (document.querySelector('[class*="feed"], [role="feed"], [class*="timeline"]')) {
+        pageType = 'feed';
+      } else if (document.querySelector('ul, ol, [role="list"], [role="listbox"]')) {
+        var lists = document.querySelectorAll('ul, ol, [role="list"], [role="listbox"]');
+        for (var li = 0; li < lists.length; li++) {
+          if (lists[li].children.length > 5) { pageType = 'list'; break; }
+        }
+      }
+      // SPA/app detection
+      if (pageType === 'unknown') {
+        if (document.querySelector('#app, #root, #__next, [id*="react"], [data-reactroot]')) {
+          pageType = 'app';
+        }
+      }
+
+      // --- Scroll Info ---
+      var maxScroll = document.documentElement.scrollHeight - vh;
+      var windowScrollable = maxScroll > 50;
+      var windowScrollProgress = maxScroll > 0 ? Math.round((window.scrollY / maxScroll) * 100) : 100;
+
+      var scrollableContainers = [];
+      var candidates = document.querySelectorAll('*');
+      for (var i = 0; i < candidates.length && scrollableContainers.length < 5; i++) {
+        var c = candidates[i];
+        var st = window.getComputedStyle(c);
+        if ((st.overflowY === 'auto' || st.overflowY === 'scroll') && c.scrollHeight > c.clientHeight + 50) {
+          var containerMaxScroll = c.scrollHeight - c.clientHeight;
+          var containerProgress = containerMaxScroll > 0 ? Math.round((c.scrollTop / containerMaxScroll) * 100) : 100;
+
+          // Try to find a common item selector inside
+          var itemSelector = undefined;
+          var visibleCount = 0;
+          var children = c.children;
+          if (children.length > 2) {
+            var firstTag = children[0].tagName;
+            var firstClass = children[0].className;
+            var sameTag = Array.from(children).filter(function(ch) { return ch.tagName === firstTag; });
+            if (sameTag.length > 2) {
+              if (firstClass) {
+                var cls = firstClass.split(' ')[0];
+                itemSelector = '.' + cls;
+              } else {
+                itemSelector = firstTag.toLowerCase();
+              }
+              visibleCount = sameTag.length;
+            }
+          }
+
+          try {
+            scrollableContainers.push({
+              selector: (function(el) {
+                if (el.id) return '#' + CSS.escape(el.id);
+                var tag = el.tagName.toLowerCase();
+                if (el.className && typeof el.className === 'string') {
+                  var cls = el.className.trim().split(/\\s+/)[0];
+                  if (cls) return tag + '.' + cls;
+                }
+                return tag;
+              })(c),
+              scrollProgress: containerProgress,
+              itemSelector: itemSelector,
+              visibleItemCount: visibleCount
+            });
+          } catch(e) {}
+        }
+      }
+
+      // --- Content Patterns ---
+      var hasVirtualScroll = !!document.querySelector(
+        '[style*="translateY"], [style*="translate3d"], .ReactVirtualized, [class*="virtual"], [class*="Virtual"], [class*="react-window"]'
+      );
+      var hasInfiniteScroll = !!document.querySelector(
+        '[class*="infinite"], [data-infinite], .infinite-scroll-component, [class*="InfiniteScroll"]'
+      );
+      var hasPagination = false;
+      var paginationInfo = undefined;
+      var paginationEls = document.querySelectorAll('[class*="pagination"], [role="navigation"] a, .page-numbers, nav a[href*="page"], [aria-label*="page"], [aria-label*="Page"]');
+      if (paginationEls.length > 0) {
+        hasPagination = true;
+        // Try to find current and total pages
+        var currentPage = undefined;
+        var totalPages = undefined;
+        var nextSelector = undefined;
+        var activePageEl = document.querySelector('[class*="pagination"] [class*="active"], [class*="pagination"] [aria-current="page"]');
+        if (activePageEl) currentPage = parseInt(activePageEl.textContent);
+        // Find max page number
+        paginationEls.forEach(function(el) {
+          var n = parseInt(el.textContent);
+          if (!isNaN(n) && (totalPages === undefined || n > totalPages)) totalPages = n;
+        });
+        // Find "Next" button
+        var nextEl = document.querySelector('[class*="pagination"] [class*="next"], a[rel="next"], [aria-label*="next" i], [aria-label*="Next"]');
+        if (nextEl) {
+          try {
+            if (nextEl.id) nextSelector = '#' + CSS.escape(nextEl.id);
+            else if (nextEl.className) nextSelector = nextEl.tagName.toLowerCase() + '.' + nextEl.className.trim().split(/\\s+/)[0];
+            else nextSelector = '[aria-label="' + nextEl.getAttribute('aria-label') + '"]';
+          } catch(e) {}
+        }
+        paginationInfo = { currentPage: currentPage, totalPages: totalPages, nextSelector: nextSelector };
+      }
+
+      // Count visible repeating items (heuristic)
+      var visibleItemCount = 0;
+      var repeatingContainers = document.querySelectorAll('ul, ol, [role="list"], [role="listbox"], table tbody, [class*="list"], [class*="grid"]');
+      repeatingContainers.forEach(function(container) {
+        visibleItemCount = Math.max(visibleItemCount, container.children.length);
+      });
+
+      // --- Network Patterns ---
+      var likelyUsesApiCalls = !!document.querySelector(
+        '#app, #root, #__next, [data-reactroot], [ng-app], [data-ng-app], [id*="ember"], [id*="svelte"]'
+      );
+
+      // --- Recommended Strategy ---
+      var strategy = '';
+      if (hasVirtualScroll) {
+        strategy = 'This page uses virtual scrolling (DOM elements are recycled as you scroll). Use browser_intercept_api with scroll trigger to capture the underlying API data. Direct DOM scraping will miss items.';
+      } else if (hasPagination) {
+        strategy = 'This page uses pagination. ';
+        if (paginationInfo && paginationInfo.currentPage && paginationInfo.totalPages) {
+          strategy += 'Currently on page ' + paginationInfo.currentPage + ' of ' + paginationInfo.totalPages + '. ';
+        }
+        if (paginationInfo && paginationInfo.nextSelector) {
+          strategy += 'Click the next button (' + paginationInfo.nextSelector + ') to navigate pages. Use browser_inspect_page on each page.';
+        } else {
+          strategy += 'Navigate pages and use browser_inspect_page on each page to collect data.';
+        }
+      } else if (hasInfiniteScroll) {
+        strategy = 'This page uses infinite scrolling. Use browser_scroll_collect with an item selector to scroll and collect all items. The tool handles deduplication and end-of-content detection.';
+      } else if (likelyUsesApiCalls && pageType === 'app') {
+        strategy = 'This appears to be a single-page application. Use browser_intercept_api to capture API calls triggered by user actions (scroll, click). The API responses contain structured data.';
+      } else if (pageType === 'table') {
+        strategy = 'This page has a data table. Use browser_get_dom with a selector scoped to the table to extract all rows, or browser_evaluate with JavaScript to extract structured data.';
+      } else if (pageType === 'form') {
+        strategy = 'This page has a form. Use browser_inspect_page to see all fields, then browser_fill_form to batch-fill.';
+      } else {
+        strategy = 'This is a standard page. Use browser_inspect_page for interactive elements and browser_get_dom for full content.';
+        if (windowScrollable) {
+          strategy += ' The page is scrollable — there may be more content below.';
+        }
+      }
+
+      return {
+        pageType: pageType,
+        scrollInfo: {
+          windowScrollable: windowScrollable,
+          scrollProgress: windowScrollProgress,
+          scrollableContainers: scrollableContainers
+        },
+        contentPatterns: {
+          hasVirtualScroll: hasVirtualScroll,
+          hasInfiniteScroll: hasInfiniteScroll,
+          hasPagination: hasPagination,
+          paginationInfo: paginationInfo,
+          visibleItemCount: visibleItemCount
+        },
+        networkPatterns: {
+          likelyUsesApiCalls: likelyUsesApiCalls
+        },
+        recommendedStrategy: strategy
+      };
+    })()
+  `);
+}
+
+// ---- Scroll & Collect ----
+
+export interface ScrollCollectOptions {
+  containerSelector?: string;
+  maxItems?: number;
+  maxScrolls?: number;
+  scrollAmount?: number;
+  extractAttributes?: string[];
+  includeHtml?: boolean;
+  waitMs?: number;
+}
+
+export interface CollectedItem {
+  text: string;
+  html?: string;
+  attributes?: Record<string, string>;
+}
+
+export interface ScrollCollectResult {
+  items: CollectedItem[];
+  totalCollected: number;
+  scrolledToEnd: boolean;
+  scrollIterations: number;
+}
+
+export async function scrollAndCollect(
+  itemSelector: string,
+  options: ScrollCollectOptions = {},
+): Promise<ScrollCollectResult> {
+  const {
+    containerSelector,
+    maxItems = 500,
+    maxScrolls = 50,
+    scrollAmount = 500,
+    extractAttributes = [],
+    includeHtml = false,
+    waitMs = 500,
+  } = options;
+
+  return evaluate<ScrollCollectResult>(`
+    (async function() {
+      var itemSel = ${JSON.stringify(itemSelector)};
+      var containerSel = ${JSON.stringify(containerSelector ?? null)};
+      var maxItems = ${maxItems};
+      var maxScrolls = ${maxScrolls};
+      var scrollAmt = ${scrollAmount};
+      var extractAttrs = ${JSON.stringify(extractAttributes)};
+      var includeHtml = ${includeHtml};
+      var waitMs = ${waitMs};
+
+      var container = containerSel ? document.querySelector(containerSel) : null;
+      var scrollTarget = container || window;
+
+      var seenTexts = new Set();
+      var items = [];
+      var noNewCount = 0;
+      var scrollIterations = 0;
+
+      function collectItems() {
+        var els = (container || document).querySelectorAll(itemSel);
+        var newCount = 0;
+        for (var i = 0; i < els.length && items.length < maxItems; i++) {
+          var text = (els[i].textContent || '').trim().substring(0, 500);
+          if (!text || seenTexts.has(text)) continue;
+          seenTexts.add(text);
+          var item = { text: text };
+          if (includeHtml) item.html = els[i].outerHTML.substring(0, 1000);
+          if (extractAttrs.length > 0) {
+            var attrs = {};
+            extractAttrs.forEach(function(a) {
+              var v = els[i].getAttribute(a);
+              if (v) attrs[a] = v;
+            });
+            if (Object.keys(attrs).length > 0) item.attributes = attrs;
+          }
+          items.push(item);
+          newCount++;
+        }
+        return newCount;
+      }
+
+      // Initial collection
+      collectItems();
+
+      // Scroll loop
+      while (scrollIterations < maxScrolls && items.length < maxItems) {
+        if (container) {
+          container.scrollBy(0, scrollAmt);
+        } else {
+          window.scrollBy(0, scrollAmt);
+        }
+
+        // Wait for lazy content
+        await new Promise(function(r) { setTimeout(r, waitMs); });
+        scrollIterations++;
+
+        var newItems = collectItems();
+        if (newItems === 0) {
+          noNewCount++;
+          if (noNewCount >= 3) break; // No new items after 3 scrolls = end of content
+        } else {
+          noNewCount = 0;
+        }
+      }
+
+      // Detect if we reached the end
+      var scrolledToEnd = false;
+      if (container) {
+        scrolledToEnd = container.scrollTop + container.clientHeight >= container.scrollHeight - 20;
+      } else {
+        scrolledToEnd = window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 20;
+      }
+      scrolledToEnd = scrolledToEnd || noNewCount >= 3;
+
+      return {
+        items: items,
+        totalCollected: items.length,
+        scrolledToEnd: scrolledToEnd,
+        scrollIterations: scrollIterations
+      };
+    })()
+  `);
+}
+
+// ---- API Interception ----
+
+export interface InterceptTrigger {
+  type: 'scroll' | 'click' | 'wait';
+  selector?: string;  // for click
+  scrollAmount?: number;
+}
+
+export interface InterceptOptions {
+  urlFilter?: string;
+  methodFilter?: string;
+  maxResponses?: number;
+  waitAfterTriggerMs?: number;
+}
+
+export interface InterceptedRequest {
+  url: string;
+  method: string;
+  status: number;
+  responseJson?: unknown;
+  responseBody?: string;
+}
+
+export interface InterceptResult {
+  requests: InterceptedRequest[];
+  totalCaptured: number;
+  filteredCount: number;
+}
+
+export async function interceptApiCalls(
+  trigger: InterceptTrigger,
+  options: InterceptOptions = {},
+): Promise<InterceptResult> {
+  const {
+    urlFilter,
+    methodFilter,
+    maxResponses = 20,
+    waitAfterTriggerMs = 2000,
+  } = options;
+
+  const cdp = await getClient();
+
+  // Start fresh network capture
+  const interceptedRequests = new Map<string, {
+    requestId: string;
+    method: string;
+    url: string;
+    type: string;
+    status?: number;
+  }>();
+
+  // Collect response bodies we want to retrieve
+  const completedRequestIds: string[] = [];
+
+  const requestHandler = (params: object) => {
+    const p = params as { requestId: string; request: { method: string; url: string }; type?: string };
+    // Only capture XHR and Fetch
+    if (p.type === 'XHR' || p.type === 'Fetch') {
+      if (urlFilter && !p.request.url.includes(urlFilter)) return;
+      if (methodFilter && p.request.method.toUpperCase() !== methodFilter.toUpperCase()) return;
+      interceptedRequests.set(p.requestId, {
+        requestId: p.requestId,
+        method: p.request.method,
+        url: p.request.url,
+        type: p.type,
+      });
+    }
+  };
+
+  const responseHandler = (params: object) => {
+    const p = params as { requestId: string; response?: { status?: number } };
+    const req = interceptedRequests.get(p.requestId);
+    if (req && p.response) {
+      req.status = p.response.status;
+      completedRequestIds.push(p.requestId);
+    }
+  };
+
+  cdp.on('Network.requestWillBeSent', requestHandler);
+  cdp.on('Network.responseReceived', responseHandler);
+
+  try {
+    // Perform the trigger action
+    switch (trigger.type) {
+      case 'scroll':
+        await evaluate(`window.scrollBy(0, ${trigger.scrollAmount ?? 500})`);
+        break;
+      case 'click':
+        if (trigger.selector) {
+          await evaluate(`
+            (function() {
+              var el = document.querySelector(${JSON.stringify(trigger.selector)});
+              if (!el) throw new Error('Trigger element not found: ${trigger.selector}');
+              el.click();
+            })()
+          `);
+        }
+        break;
+      case 'wait':
+        // Just wait — capture whatever network activity is happening
+        break;
+    }
+
+    // Wait for responses
+    await new Promise(r => setTimeout(r, waitAfterTriggerMs));
+
+    // Collect response bodies
+    const results: InterceptedRequest[] = [];
+    const idsToFetch = completedRequestIds.slice(0, maxResponses);
+
+    for (const reqId of idsToFetch) {
+      const req = interceptedRequests.get(reqId);
+      if (!req) continue;
+
+      try {
+        const { body, base64Encoded } = await cdp.Network.getResponseBody({ requestId: reqId });
+        const responseBody = base64Encoded ? '[base64 encoded]' : body;
+        let responseJson: unknown = undefined;
+
+        // Try to parse as JSON
+        if (!base64Encoded) {
+          try { responseJson = JSON.parse(body); } catch { /* not JSON */ }
+        }
+
+        results.push({
+          url: req.url,
+          method: req.method,
+          status: req.status ?? 0,
+          responseJson,
+          responseBody: responseJson ? undefined : responseBody?.substring(0, 5000),
+        });
+      } catch {
+        results.push({
+          url: req.url,
+          method: req.method,
+          status: req.status ?? 0,
+          responseBody: '[could not retrieve body]',
+        });
+      }
+    }
+
+    return {
+      requests: results,
+      totalCaptured: interceptedRequests.size,
+      filteredCount: results.length,
+    };
+  } finally {
+    // Clean up listeners
+    if (CDP_MODE === 'extension') {
+      (cdp as CDPProxyClient).removeListener('Network.requestWillBeSent', requestHandler);
+      (cdp as CDPProxyClient).removeListener('Network.responseReceived', responseHandler);
+    } else {
+      (cdp as unknown as import('events').EventEmitter).removeListener('Network.requestWillBeSent', requestHandler);
+      (cdp as unknown as import('events').EventEmitter).removeListener('Network.responseReceived', responseHandler);
+    }
+  }
+}
+
 export async function disconnect(): Promise<void> {
   if (client) {
-    await client.close();
+    try { client.close(); } catch { /* ignore */ }
     client = null;
   }
 }

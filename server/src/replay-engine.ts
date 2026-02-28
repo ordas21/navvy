@@ -164,7 +164,7 @@ function executeStepViaClaude(prompt: string, mode: Mode): Promise<string> {
     let hasError = false;
 
     const sessionId = `replay-${Date.now()}`;
-    const proc = runClaude(prompt, mode, sessionId, (msg) => {
+    const proc = runClaude(prompt, mode, 'sonnet', sessionId, (msg) => {
       if (msg.type === 'text_delta' && msg.text) {
         resultText += msg.text;
       }

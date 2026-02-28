@@ -26,7 +26,7 @@ export async function executeScheduledTask(task: ScheduledTask): Promise<RunResu
     }
 
     try {
-      const proc = runClaude(task.prompt, mode, sessionId, (msg) => {
+      const proc = runClaude(task.prompt, mode, 'sonnet', sessionId, (msg) => {
         switch (msg.type) {
           case 'text_delta':
             if (msg.text) resultText += msg.text;

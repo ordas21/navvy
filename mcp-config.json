@@ -2,7 +2,10 @@
   "mcpServers": {
     "browser": {
       "command": "node",
-      "args": ["./mcp-server/dist/index.js"]
+      "args": ["./mcp-server/dist/index.js"],
+      "env": {
+        "NAVVY_CDP_MODE": "extension"
+      }
     }
   }
 }

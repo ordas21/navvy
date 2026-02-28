@@ -8,6 +8,7 @@ export interface ClientMessage {
   prompt?: string;
   attachments?: Attachment[];
   mode?: Mode;
+  model?: string;
   // Approval response fields
   approvalId?: string;
   approvalResponse?: 'approve' | 'deny' | 'approve_always';

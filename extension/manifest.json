@@ -7,7 +7,8 @@
     "sidePanel",
     "activeTab",
     "tabs",
-    "storage"
+    "storage",
+    "debugger"
   ],
   "side_panel": {
     "default_path": "sidepanel.html"
