@@ -138,6 +138,17 @@
         <label>Server URL
           <input type="text" id="setting-server-url" value="ws://localhost:3300/ws">
         </label>
+        <label>API Key
+          <input type="password" id="setting-api-key" placeholder="nvk_... (optional for local)">
+        </label>
+        <label>Model
+          <select id="setting-model">
+            <option value="auto">Auto (smart routing)</option>
+            <option value="sonnet">Sonnet</option>
+            <option value="opus">Opus</option>
+            <option value="haiku">Haiku</option>
+          </select>
+        </label>
         <div id="settings-actions">
           <button id="btn-settings-save">Save</button>
           <button id="btn-settings-cancel">Cancel</button>

@@ -1,7 +1,7 @@
 /* global chrome, loadConversationIndex, loadConversation, appendToConversation,
    createConversation, deleteConversation, updateConversationIndex,
    getActiveConversationId, setActiveConversationId, checkStorageUsage,
-   flushAllPendingAppends, marked, DOMPurify */
+   flushAllPendingAppends, setServerConfig, marked, DOMPurify */
 
 // ---- Markdown rendering ----
 marked.setOptions({ breaks: true, gfm: true });
@@ -20,7 +20,9 @@ let activeConversationId = null;
 let isRunning = false;
 let attachments = [];
 let serverUrl = DEFAULT_SERVER_URL;
+let apiKey = '';
 let currentMode = 'auto';
+let currentModel = 'auto';
 
 // Current streaming elements
 let currentTextEl = null;
@@ -533,7 +535,8 @@ function connectWebSocket() {
   }
 
   setStatus('connecting', 'Connecting...');
-  ws = new WebSocket(serverUrl);
+  const wsUrl = apiKey ? `${serverUrl}?apiKey=${encodeURIComponent(apiKey)}` : serverUrl;
+  ws = new WebSocket(wsUrl);
 
   ws.onopen = () => {
     setStatus('connected', 'Connected');
@@ -1034,6 +1037,7 @@ async function sendPrompt() {
     sessionId,
     prompt: text,
     mode: currentMode,
+    model: currentModel,
     attachments: attachments.length > 0 ? attachments : undefined,
   };
 
@@ -1282,14 +1286,25 @@ function formatRelativeTime(date) {
 
 async function boot() {
   // Load settings
-  const settingsResult = await chrome.storage.local.get(['serverUrl', 'currentMode']);
+  const settingsResult = await chrome.storage.local.get(['serverUrl', 'apiKey', 'currentMode', 'currentModel']);
   if (settingsResult.serverUrl) {
     serverUrl = settingsResult.serverUrl;
     settingServerUrl.value = serverUrl;
   }
+  if (settingsResult.apiKey) {
+    apiKey = settingsResult.apiKey;
+    document.getElementById('setting-api-key').value = apiKey;
+  }
   if (settingsResult.currentMode) {
     setMode(settingsResult.currentMode);
   }
+  if (settingsResult.currentModel) {
+    currentModel = settingsResult.currentModel;
+    document.getElementById('setting-model').value = currentModel;
+  }
+
+  // Configure server storage layer
+  setServerConfig(serverUrl, apiKey);
 
   // Load or create active conversation
   let convId = await getActiveConversationId();
@@ -1361,7 +1376,10 @@ promptInput.addEventListener('keydown', (e) => {
 // Settings
 btnSettingsSave.addEventListener('click', () => {
   serverUrl = settingServerUrl.value.trim();
-  chrome.storage.local.set({ serverUrl });
+  apiKey = document.getElementById('setting-api-key').value.trim();
+  currentModel = document.getElementById('setting-model').value;
+  chrome.storage.local.set({ serverUrl, apiKey, currentModel });
+  setServerConfig(serverUrl, apiKey);
   settingsOverlay.style.display = 'none';
   connectWebSocket();
 });
@@ -1373,6 +1391,8 @@ btnSettingsCancel.addEventListener('click', () => {
 // Settings
 btnSettings.addEventListener('click', () => {
   settingServerUrl.value = serverUrl;
+  document.getElementById('setting-api-key').value = apiKey;
+  document.getElementById('setting-model').value = currentModel;
   settingsOverlay.style.display = 'flex';
 });
 
