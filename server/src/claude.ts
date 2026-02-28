@@ -7,12 +7,37 @@ import type { ServerMessage, CostInfo, Mode } from './types.js';
 import { SessionTracker, finalizeSession, getLearningsForPrompt, extractHostname, SELF_REVIEW_PROMPT } from './learnings.js';
 import { addCheckpoint, createCheckpointSession } from './checkpoints.js';
 import { isRecording, recordAction } from './workflows.js';
+import { getDb } from './db.js';
 
 // Maps navvy conversation IDs (from extension) to Claude CLI session UUIDs
 const claudeSessionMap = new Map<string, string>();
 
 export function clearClaudeSession(navvySessionId: string): void {
   claudeSessionMap.delete(navvySessionId);
+}
+
+function trackProcess(sessionId: string, pid: number | undefined, model: string, mode: Mode): void {
+  try {
+    const db = getDb();
+    db.prepare(`
+      INSERT OR REPLACE INTO active_processes (session_id, pid, status, started_at, model, mode)
+      VALUES (?, ?, 'running', ?, ?, ?)
+    `).run(sessionId, pid ?? null, Date.now(), model, mode);
+  } catch { /* non-critical */ }
+}
+
+function untrackProcess(sessionId: string): void {
+  try {
+    const db = getDb();
+    db.prepare('DELETE FROM active_processes WHERE session_id = ?').run(sessionId);
+  } catch { /* non-critical */ }
+}
+
+export function cleanupStaleProcesses(): void {
+  try {
+    const db = getDb();
+    db.prepare('DELETE FROM active_processes').run();
+  } catch { /* non-critical */ }
 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -30,13 +55,59 @@ try {
 
 export type OnMessage = (msg: Omit<ServerMessage, 'sessionId'>) => void;
 
+// ---- Smart model routing ----
+
+const COMPLEX_PATTERNS = [
+  /\b(analyze|debug|investigate|diagnose|explain why|figure out|compare|evaluate|review|assess|optimize|refactor|architect)\b/i,
+  /\b(strategy|plan|design|recommend)\b/i,
+  /\b(across (?:all|multiple|every)|all (?:files|pages|tabs))\b/i,
+  /\b(sort|rank|prioritize|organize) .{20,}/i,
+  /\b(write|create|build|implement) (?:a |an )?(?:script|program|function|workflow|macro)\b/i,
+  /\b(extract .{30,})/i,
+  /\b(step[- ]by[- ]step|systematically|thoroughly)\b/i,
+];
+
+const SIMPLE_PATTERNS = [
+  /^(?:click|tap|press|go to|navigate to|open|close|scroll|type|fill in|check|uncheck|select)\b/i,
+  /^(?:what is|what's) (?:the |this )?(?:url|title|page|value|text|status)\b/i,
+  /^(?:take a |grab a )?screenshot\b/i,
+  /^(?:read|get|show|find) (?:the |this )?(?:value|text|title|url|status|element)\b/i,
+  /^(?:wait|pause|refresh|reload)\b/i,
+];
+
+export function selectModel(prompt: string, isFollowUp: boolean): string {
+  // Follow-ups are usually continuations — Sonnet is a good default
+  if (isFollowUp) return 'sonnet';
+
+  const trimmed = prompt.trim();
+
+  // Short simple commands → Haiku
+  if (trimmed.length < 80 && SIMPLE_PATTERNS.some(p => p.test(trimmed))) {
+    return 'haiku';
+  }
+
+  // Complex multi-step or analytical tasks → Opus
+  if (COMPLEX_PATTERNS.some(p => p.test(trimmed))) {
+    return 'opus';
+  }
+
+  // Long prompts with multiple sentences tend to be complex
+  const sentenceCount = trimmed.split(/[.!?]+/).filter(s => s.trim().length > 10).length;
+  if (sentenceCount >= 4 || trimmed.length > 500) {
+    return 'opus';
+  }
+
+  // Default → Sonnet
+  return 'sonnet';
+}
+
 const BASE_PROMPT = `You are a browser automation agent. You can see and interact with web pages through a set of browser tools.
 
 ## CRITICAL RULES — Read These First
-- NEVER scroll through a page to "explore" or "see what's there" before acting. browser_inspect_page already returns ALL interactive elements on the page, including off-screen ones.
+- When encountering a complex web app with many items, use browser_analyze_page FIRST to detect the page type and get a recommended interaction strategy.
 - NEVER take a screenshot as your first action. Use browser_inspect_page instead — it's faster and gives you structured data with ready-to-use selectors.
 - NEVER fill form fields one at a time with click+type. Use browser_fill_form to batch-fill ALL fields in a single call.
-- NEVER scroll just to look around. Only scroll if you need to interact with an element that browser_fill_form can't reach, or if you need visual context a screenshot can't provide from the current viewport.
+- browser_inspect_page returns up to 500 interactive elements and reports the total count. If there are more elements than shown, use browser_analyze_page to determine the best extraction strategy.
 
 ## Core Workflow
 1. browser_inspect_page → get all interactive elements, their selectors, labels, values, and states
@@ -57,7 +128,10 @@ That's 3-4 tool calls total. NOT one per field.
 - If a selector fails, fall back to browser_get_dom for the full DOM tree
 
 ## Available Tools
-- browser_inspect_page: structured overview of ALL interactive elements (use this first, always)
+- browser_inspect_page: structured overview of up to 500 interactive elements with total count (use this first, always)
+- browser_analyze_page: detect page type (virtual scroll, infinite scroll, paginated, static) and get recommended strategy
+- browser_scroll_collect: scroll through content collecting items by CSS selector — handles infinite scroll, deduplication, lazy loading
+- browser_intercept_api: trigger an action (scroll/click/wait) and capture API responses — ideal for SPAs and virtual scroll apps
 - browser_fill_form: batch-fill multiple fields in one call (text, select, checkbox, radio — works with React/Vue/Angular)
 - browser_click: click by CSS selector
 - browser_type: type into focused element
@@ -132,7 +206,19 @@ Dangerous actions (purchases, deletions, git push) may require user approval. If
 ## Error Recovery
 - If an action fails, use browser_inspect_page to understand current state
 - Try a different selector or approach — don't repeat the same failed action
-- If a page is loading, use browser_wait before proceeding`;
+- If a page is loading, use browser_wait before proceeding
+
+## Page Analysis & Data Extraction Strategy
+When working with complex web apps or long lists:
+1. Use browser_analyze_page to detect page type (virtual scroll, infinite scroll, paginated, static)
+2. Choose strategy based on type:
+   - Static: inspect_page + get_dom
+   - Paginated: inspect each page, click next
+   - Infinite scroll: browser_scroll_collect with item selector
+   - Virtual scroll (Google Drive, Trello, Notion): use browser_intercept_api — DOM elements are recycled
+   - API-driven apps: browser_intercept_api with scroll/click triggers
+3. Network interception is preferred for XHR/Fetch apps — gives structured JSON
+4. For sorting large lists: determine total count first, then decide strategy`;
 
 const MODE_PROMPTS: Record<Mode, string> = {
   auto: `## Mode: Auto
@@ -193,7 +279,7 @@ function buildSystemPrompt(mode: Mode, hostname?: string): string {
   return prompt;
 }
 
-export function runClaude(prompt: string, mode: Mode, navvySessionId: string, onMessage: OnMessage): ChildProcess {
+export function runClaude(prompt: string, mode: Mode, model: string, navvySessionId: string, onMessage: OnMessage): ChildProcess {
   const hostname = extractHostname(prompt);
   const isFollowUp = claudeSessionMap.has(navvySessionId);
 
@@ -221,7 +307,7 @@ export function runClaude(prompt: string, mode: Mode, navvySessionId: string, on
     '--verbose',
     '--mcp-config', MCP_CONFIG,
     '--allowedTools', 'mcp__browser__*',
-    '--model', 'sonnet',
+    '--model', model,
     '--dangerously-skip-permissions',
   ];
 
@@ -252,6 +338,9 @@ export function runClaude(prompt: string, mode: Mode, navvySessionId: string, on
   });
 
   console.log(`[claude] Process started, PID: ${proc.pid}`);
+
+  // Track process in DB
+  trackProcess(navvySessionId, proc.pid, model, mode);
 
   // Wrap onMessage to feed events into the tracker
   const trackedOnMessage: OnMessage = (msg) => {
@@ -330,6 +419,9 @@ export function runClaude(prompt: string, mode: Mode, navvySessionId: string, on
         } catch (err) {
           console.error('[learnings] Failed to finalize session:', err);
         }
+
+        // Untrack process
+        untrackProcess(navvySessionId);
         break;
     }
     // Forward to original handler
@@ -379,6 +471,7 @@ export function runClaude(prompt: string, mode: Mode, navvySessionId: string, on
   proc.on('close', (code) => {
     clearTimeout(startupTimer);
     console.log(`[claude] Process exited with code ${code}`);
+    untrackProcess(navvySessionId);
     if (code !== 0) {
       const errMsg = stderrBuffer.trim() || `Claude exited with code ${code}`;
       trackedOnMessage({ type: 'error', error: errMsg });
