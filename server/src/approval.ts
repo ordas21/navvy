@@ -1,11 +1,5 @@
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { v4 as uuidv4 } from 'uuid';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = path.resolve(__dirname, '../data');
-const POLICIES_FILE = path.join(DATA_DIR, 'approval-policies.json');
+import { getDb } from './db.js';
 
 // --- Types ---
 
@@ -32,7 +26,7 @@ interface PolicyStore {
   policies: ApprovalPolicy[];
 }
 
-// --- Built-in dangerous patterns (always require approval unless overridden) ---
+// --- Built-in dangerous patterns ---
 
 const DANGEROUS_PATTERNS: Array<{ toolName: string; inputMatch: string; trustLevel: 'dangerous' | 'sensitive'; reason: string }> = [
   { toolName: 'system_shell', inputMatch: 'git push|rm -rf|sudo|shutdown|reboot', trustLevel: 'dangerous', reason: 'Destructive system command' },
@@ -43,29 +37,54 @@ const DANGEROUS_PATTERNS: Array<{ toolName: string; inputMatch: string; trustLev
   { toolName: 'system_write_file', inputMatch: '\\.env|credentials|secret|password|token', trustLevel: 'sensitive', reason: 'Writing to sensitive file' },
 ];
 
-// --- Pending approvals (in-memory, keyed by approval ID) ---
+// --- Pending approvals (in-memory) ---
 
 const pendingApprovals = new Map<string, {
   resolve: (approved: boolean) => void;
   timer: ReturnType<typeof setTimeout>;
 }>();
 
+// --- DB Helpers ---
+
+interface PolicyRow {
+  id: string;
+  pattern: string;
+  action: string;
+  trust_level: string;
+  created_at: number;
+}
+
+function rowToPolicy(row: PolicyRow): ApprovalPolicy {
+  return {
+    id: row.id,
+    pattern: JSON.parse(row.pattern),
+    action: row.action as ApprovalPolicy['action'],
+    trustLevel: row.trust_level as ApprovalPolicy['trustLevel'],
+    createdAt: row.created_at,
+  };
+}
+
 // --- Storage ---
 
 export function loadPolicies(): PolicyStore {
-  try {
-    const raw = fs.readFileSync(POLICIES_FILE, 'utf-8');
-    return JSON.parse(raw) as PolicyStore;
-  } catch {
-    return { version: 1, policies: [] };
-  }
+  const db = getDb();
+  const rows = db.prepare('SELECT * FROM approval_policies ORDER BY created_at ASC').all() as PolicyRow[];
+  return { version: 1, policies: rows.map(rowToPolicy) };
 }
 
 export function savePolicies(store: PolicyStore): void {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  const tmp = POLICIES_FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(store, null, 2));
-  fs.renameSync(tmp, POLICIES_FILE);
+  const db = getDb();
+  const tx = db.transaction(() => {
+    db.prepare('DELETE FROM approval_policies').run();
+    const insert = db.prepare(`
+      INSERT INTO approval_policies (id, pattern, action, trust_level, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+    for (const p of store.policies) {
+      insert.run(p.id, JSON.stringify(p.pattern), p.action, p.trustLevel, p.createdAt);
+    }
+  });
+  tx();
 }
 
 // --- Policy Matching ---
@@ -73,7 +92,6 @@ export function savePolicies(store: PolicyStore): void {
 export function checkApproval(toolName: string, toolInput: string, _hostname?: string): { needsApproval: boolean; trustLevel: string; reason: string } | null {
   const store = loadPolicies();
 
-  // Check user-defined policies first (higher priority)
   for (const policy of store.policies) {
     if (policy.pattern.toolName && !toolName.includes(policy.pattern.toolName)) continue;
     if (policy.pattern.inputMatch) {
@@ -89,7 +107,6 @@ export function checkApproval(toolName: string, toolInput: string, _hostname?: s
     return { needsApproval: true, trustLevel: policy.trustLevel, reason: 'Required by policy' };
   }
 
-  // Check built-in dangerous patterns
   for (const pattern of DANGEROUS_PATTERNS) {
     if (!toolName.includes(pattern.toolName)) continue;
     try {
@@ -112,7 +129,7 @@ export function createApprovalRequest(sessionId: string, toolName: string, toolI
     id: uuidv4(),
     sessionId,
     toolName,
-    toolInput: toolInput.substring(0, 2000), // Truncate for display
+    toolInput: toolInput.substring(0, 2000),
     trustLevel,
     reason,
     timestamp: Date.now(),
@@ -123,7 +140,7 @@ export function waitForApproval(approvalId: string, timeoutMs: number = 300000):
   return new Promise<boolean>((resolve) => {
     const timer = setTimeout(() => {
       pendingApprovals.delete(approvalId);
-      resolve(false); // Auto-deny on timeout
+      resolve(false);
     }, timeoutMs);
 
     pendingApprovals.set(approvalId, { resolve, timer });
@@ -138,17 +155,18 @@ export function resolveApproval(approvalId: string, approved: boolean, alwaysAll
   pendingApprovals.delete(approvalId);
   pending.resolve(approved);
 
-  // If "always allow", add a policy
   if (approved && alwaysAllow) {
-    const store = loadPolicies();
-    store.policies.push({
-      id: uuidv4(),
-      pattern: { toolName: alwaysAllow.toolName, inputMatch: alwaysAllow.inputMatch },
-      action: 'auto_allow',
-      trustLevel: 'normal',
-      createdAt: Date.now(),
-    });
-    savePolicies(store);
+    const db = getDb();
+    db.prepare(`
+      INSERT INTO approval_policies (id, pattern, action, trust_level, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(
+      uuidv4(),
+      JSON.stringify({ toolName: alwaysAllow.toolName, inputMatch: alwaysAllow.inputMatch }),
+      'auto_allow',
+      'normal',
+      Date.now(),
+    );
   }
 
   return true;

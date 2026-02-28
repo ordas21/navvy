@@ -1,12 +1,6 @@
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { v4 as uuidv4 } from 'uuid';
 import type { CostInfo, Mode } from './types.js';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = path.resolve(__dirname, '../data');
-const LEARNINGS_FILE = path.join(DATA_DIR, 'learnings.json');
+import { getDb } from './db.js';
 
 // --- Data Types ---
 
@@ -35,10 +29,10 @@ export interface SessionData {
 export interface Learning {
   id: string;
   type: 'self_review' | 'pattern' | 'selector_fix' | 'site_specific';
-  category: string; // 'selector' | 'efficiency' | 'error_recovery' | 'workflow'
+  category: string;
   rule: string;
   context: { hostname?: string; toolName?: string; mode?: Mode };
-  confidence: number; // 0-1, decays over time
+  confidence: number;
   reinforcements: number;
   createdAt: number;
   lastReinforcedAt: number;
@@ -53,12 +47,6 @@ interface SessionSummary {
   errorCount: number;
   startTime: number;
   durationMs?: number;
-}
-
-interface LearningsStore {
-  version: 1;
-  learnings: Learning[];
-  sessionHistory: SessionSummary[];
 }
 
 // --- SessionTracker ---
@@ -76,7 +64,6 @@ export class SessionTracker {
       toolCalls: [],
       assistantText: '',
     };
-    // Try to extract hostname from the prompt
     this.data.siteHostname = extractHostname(prompt);
   }
 
@@ -107,7 +94,6 @@ export class SessionTracker {
       this.data.toolCalls.push(record);
       this.pendingToolCalls.delete(id);
 
-      // Update hostname from browser_navigate results
       if (record.toolName === 'mcp__browser__browser_navigate' && !record.isError) {
         const navHostname = extractHostnameFromNavigateResult(record.result);
         if (navHostname) {
@@ -139,14 +125,12 @@ export class SessionTracker {
 
   finalize(): SessionData {
     this.data.endTime = Date.now();
-    // Flush any pending tool calls that never got results
     for (const record of this.pendingToolCalls.values()) {
       record.isError = true;
       record.result = '(no result received)';
       this.data.toolCalls.push(record);
     }
     this.pendingToolCalls.clear();
-    // Parse self-review from assistant text
     this.data.selfReview = parseSelfReview(this.data.assistantText);
     return this.data;
   }
@@ -173,7 +157,6 @@ const ERROR_PATTERNS = [
 ];
 
 function isErrorResult(result: string): boolean {
-  // Short results that match error patterns
   const firstLine = result.split('\n')[0].substring(0, 300);
   return ERROR_PATTERNS.some((p) => p.test(firstLine));
 }
@@ -181,14 +164,12 @@ function isErrorResult(result: string): boolean {
 // --- Hostname Extraction ---
 
 export function extractHostname(text: string): string | undefined {
-  // Match URLs in the text
   const urlMatch = text.match(/https?:\/\/([^\/\s"'<>]+)/);
   if (urlMatch) return urlMatch[1].replace(/^www\./, '');
   return undefined;
 }
 
 function extractHostnameFromNavigateResult(result: string): string | undefined {
-  // Navigate results often contain the URL that was navigated to
   return extractHostname(result);
 }
 
@@ -197,7 +178,7 @@ function extractHostnameFromNavigateResult(result: string): string | undefined {
 type AnalysisRule = (session: SessionData) => Learning | null;
 
 const analysisRules: AnalysisRule[] = [
-  // Rule 1: Repeated tool failures — same tool fails 2+ times in a row
+  // Rule 1: Repeated tool failures
   (session) => {
     const calls = session.toolCalls;
     for (let i = 1; i < calls.length; i++) {
@@ -218,7 +199,7 @@ const analysisRules: AnalysisRule[] = [
     return null;
   },
 
-  // Rule 2: Selector fix detection — tool fails with selector A, succeeds with selector B
+  // Rule 2: Selector fix detection
   (session) => {
     const calls = session.toolCalls;
     for (let i = 1; i < calls.length; i++) {
@@ -246,7 +227,7 @@ const analysisRules: AnalysisRule[] = [
     return null;
   },
 
-  // Rule 3: Inefficient sessions — >15 tool calls
+  // Rule 3: Inefficient sessions
   (session) => {
     if (session.toolCalls.length > 15) {
       return makeLearning({
@@ -261,7 +242,7 @@ const analysisRules: AnalysisRule[] = [
     return null;
   },
 
-  // Rule 4: Screenshot-before-inspect — first tool is screenshot
+  // Rule 4: Screenshot-before-inspect
   (session) => {
     const first = session.toolCalls[0];
     if (first && first.toolName === 'mcp__browser__browser_screenshot') {
@@ -276,7 +257,7 @@ const analysisRules: AnalysisRule[] = [
     return null;
   },
 
-  // Rule 5: Individual field filling — alternating click/type 4+ times
+  // Rule 5: Individual field filling
   (session) => {
     let alternatingCount = 0;
     const calls = session.toolCalls;
@@ -304,7 +285,7 @@ const analysisRules: AnalysisRule[] = [
     return null;
   },
 
-  // Rule 6: Mode mismatch — screenshot mode but heavy inspect_page usage
+  // Rule 6: Mode mismatch
   (session) => {
     if (session.mode !== 'screenshot') return null;
     const inspectCount = session.toolCalls.filter(
@@ -340,7 +321,6 @@ function extractSelector(input: string): string | undefined {
     const parsed = JSON.parse(input);
     return parsed.selector || parsed.css || undefined;
   } catch {
-    // Try regex fallback for partial JSON
     const match = input.match(/"selector"\s*:\s*"([^"]+)"/);
     return match ? match[1] : undefined;
   }
@@ -401,54 +381,112 @@ function findDuplicate(
   );
 }
 
-// --- Storage ---
+// --- DB Helpers ---
 
-function loadStore(): LearningsStore {
-  try {
-    const raw = fs.readFileSync(LEARNINGS_FILE, 'utf-8');
-    return JSON.parse(raw) as LearningsStore;
-  } catch {
-    return { version: 1, learnings: [], sessionHistory: [] };
-  }
+interface LearningRow {
+  id: string;
+  type: string;
+  category: string;
+  rule: string;
+  context_hostname: string | null;
+  context_tool_name: string | null;
+  context_mode: string | null;
+  confidence: number;
+  reinforcements: number;
+  created_at: number;
+  last_reinforced_at: number;
+  source_session_ids: string;
 }
 
-function saveStore(store: LearningsStore): void {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  const tmp = LEARNINGS_FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(store, null, 2));
-  fs.renameSync(tmp, LEARNINGS_FILE);
+function rowToLearning(row: LearningRow): Learning {
+  return {
+    id: row.id,
+    type: row.type as Learning['type'],
+    category: row.category,
+    rule: row.rule,
+    context: {
+      hostname: row.context_hostname ?? undefined,
+      toolName: row.context_tool_name ?? undefined,
+      mode: (row.context_mode as Mode) ?? undefined,
+    },
+    confidence: row.confidence,
+    reinforcements: row.reinforcements,
+    createdAt: row.created_at,
+    lastReinforcedAt: row.last_reinforced_at,
+    sourceSessionIds: JSON.parse(row.source_session_ids),
+  };
+}
+
+function loadAllLearnings(): Learning[] {
+  const db = getDb();
+  const rows = db.prepare('SELECT * FROM learnings').all() as LearningRow[];
+  return rows.map(rowToLearning);
+}
+
+function saveLearning(l: Learning): void {
+  const db = getDb();
+  db.prepare(`
+    INSERT OR REPLACE INTO learnings (id, type, category, rule, context_hostname, context_tool_name, context_mode, confidence, reinforcements, created_at, last_reinforced_at, source_session_ids)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    l.id, l.type, l.category, l.rule,
+    l.context.hostname ?? null, l.context.toolName ?? null, l.context.mode ?? null,
+    l.confidence, l.reinforcements,
+    l.createdAt, l.lastReinforcedAt,
+    JSON.stringify(l.sourceSessionIds),
+  );
+}
+
+function deleteLearning(id: string): void {
+  const db = getDb();
+  db.prepare('DELETE FROM learnings WHERE id = ?').run(id);
 }
 
 // --- Decay & Cleanup ---
 
-function decayAndCleanup(store: LearningsStore): void {
+function decayAndCleanup(): void {
   const now = Date.now();
   const ONE_WEEK = 7 * 24 * 60 * 60 * 1000;
+  const db = getDb();
 
-  for (const learning of store.learnings) {
+  const learnings = loadAllLearnings();
+
+  for (const learning of learnings) {
     const weeksSinceReinforced = (now - learning.lastReinforcedAt) / ONE_WEEK;
     if (weeksSinceReinforced < 1) continue;
 
     const decayRate = learning.reinforcements >= 3 ? 0.02 : 0.05;
     learning.confidence -= decayRate * weeksSinceReinforced;
+
+    if (learning.confidence < 0.15) {
+      deleteLearning(learning.id);
+    } else {
+      db.prepare('UPDATE learnings SET confidence = ? WHERE id = ?').run(learning.confidence, learning.id);
+    }
   }
 
-  // Remove below threshold
-  store.learnings = store.learnings.filter((l) => l.confidence >= 0.15);
-
-  // Cap at 100 learnings — keep highest confidence
-  if (store.learnings.length > 100) {
-    store.learnings.sort((a, b) => b.confidence - a.confidence);
-    store.learnings = store.learnings.slice(0, 100);
+  // Cap at 100 learnings
+  const count = (db.prepare('SELECT COUNT(*) as c FROM learnings').get() as { c: number }).c;
+  if (count > 100) {
+    db.prepare(`
+      DELETE FROM learnings WHERE id NOT IN (
+        SELECT id FROM learnings ORDER BY confidence DESC LIMIT 100
+      )
+    `).run();
   }
 
   // Cap session history at 50
-  if (store.sessionHistory.length > 50) {
-    store.sessionHistory = store.sessionHistory.slice(-50);
+  const sessionCount = (db.prepare('SELECT COUNT(*) as c FROM session_history').get() as { c: number }).c;
+  if (sessionCount > 50) {
+    db.prepare(`
+      DELETE FROM session_history WHERE id NOT IN (
+        SELECT id FROM session_history ORDER BY start_time DESC LIMIT 50
+      )
+    `).run();
   }
 }
 
-// --- Self-Review → Learnings ---
+// --- Self-Review -> Learnings ---
 
 function selfReviewToLearnings(review: string, session: SessionData): Learning[] {
   const bullets = review
@@ -474,10 +512,9 @@ function selfReviewToLearnings(review: string, session: SessionData): Learning[]
 
 export function finalizeSession(tracker: SessionTracker): void {
   const session = tracker.finalize();
-  const store = loadStore();
+  const db = getDb();
 
-  // Decay existing learnings
-  decayAndCleanup(store);
+  decayAndCleanup();
 
   // Collect new learnings from analysis rules
   const newLearnings: Learning[] = [];
@@ -492,53 +529,56 @@ export function finalizeSession(tracker: SessionTracker): void {
     newLearnings.push(...selfReviewToLearnings(session.selfReview, session));
   }
 
+  // Load existing for deduplication
+  const existing = loadAllLearnings();
+
   // Deduplicate and merge
   for (const newL of newLearnings) {
-    const existing = findDuplicate(newL, store.learnings);
-    if (existing) {
-      // Reinforce existing
-      existing.confidence = Math.min(1, existing.confidence + 0.1);
-      existing.reinforcements++;
-      existing.lastReinforcedAt = Date.now();
-      if (!existing.sourceSessionIds.includes(session.sessionId)) {
-        existing.sourceSessionIds.push(session.sessionId);
+    const dup = findDuplicate(newL, existing);
+    if (dup) {
+      dup.confidence = Math.min(1, dup.confidence + 0.1);
+      dup.reinforcements++;
+      dup.lastReinforcedAt = Date.now();
+      if (!dup.sourceSessionIds.includes(session.sessionId)) {
+        dup.sourceSessionIds.push(session.sessionId);
       }
-      console.log(`[learnings] Reinforced: "${existing.rule.substring(0, 60)}..." (confidence: ${existing.confidence.toFixed(2)})`);
+      saveLearning(dup);
+      console.log(`[learnings] Reinforced: "${dup.rule.substring(0, 60)}..." (confidence: ${dup.confidence.toFixed(2)})`);
     } else {
-      store.learnings.push(newL);
+      saveLearning(newL);
+      existing.push(newL);
       console.log(`[learnings] New: "${newL.rule.substring(0, 60)}..." (${newL.type}, confidence: ${newL.confidence.toFixed(2)})`);
     }
   }
 
   // Add session summary
   const errorCount = session.toolCalls.filter((c) => c.isError).length;
-  store.sessionHistory.push({
-    sessionId: session.sessionId,
-    mode: session.mode,
-    hostname: session.siteHostname,
-    toolCallCount: session.toolCalls.length,
-    errorCount,
-    startTime: session.startTime,
-    durationMs: session.endTime ? session.endTime - session.startTime : undefined,
-  });
+  db.prepare(`
+    INSERT INTO session_history (session_id, mode, hostname, tool_call_count, error_count, start_time, duration_ms)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    session.sessionId, session.mode, session.siteHostname ?? null,
+    session.toolCalls.length, errorCount,
+    session.startTime, session.endTime ? session.endTime - session.startTime : null,
+  );
 
-  saveStore(store);
-  console.log(`[learnings] Session finalized. Total learnings: ${store.learnings.length}, sessions: ${store.sessionHistory.length}`);
+  const totalLearnings = (db.prepare('SELECT COUNT(*) as c FROM learnings').get() as { c: number }).c;
+  const totalSessions = (db.prepare('SELECT COUNT(*) as c FROM session_history').get() as { c: number }).c;
+  console.log(`[learnings] Session finalized. Total learnings: ${totalLearnings}, sessions: ${totalSessions}`);
 }
 
 // --- Relevance Scoring & Prompt Injection ---
 
 export function getLearningsForPrompt(mode: Mode, hostname?: string): string {
-  const store = loadStore();
-  if (store.learnings.length === 0) return '';
+  const learnings = loadAllLearnings();
+  if (learnings.length === 0) return '';
 
   const now = Date.now();
   const THREE_DAYS = 3 * 24 * 60 * 60 * 1000;
 
-  const scored = store.learnings.map((l) => {
+  const scored = learnings.map((l) => {
     let score = l.confidence;
 
-    // Hostname match
     if (hostname && l.context.hostname) {
       if (l.context.hostname === hostname) {
         score += 0.4;
@@ -547,26 +587,19 @@ export function getLearningsForPrompt(mode: Mode, hostname?: string): string {
       }
     }
 
-    // Mode match
     if (l.context.mode === mode) score += 0.1;
-
-    // Reinforcement bonus (capped at +0.2)
     score += Math.min(0.2, l.reinforcements * 0.05);
-
-    // Recency bonus
     if (now - l.lastReinforcedAt < THREE_DAYS) score += 0.1;
 
     return { learning: l, score };
   });
 
-  // Filter and sort
   const relevant = scored
     .filter((s) => s.score >= 0.1)
     .sort((a, b) => b.score - a.score);
 
   if (relevant.length === 0) return '';
 
-  // Build prompt section, capped at ~2000 chars
   const MAX_CHARS = 2000;
   let result = '\n\n## Learnings from Previous Sessions\n';
   let charCount = result.length;

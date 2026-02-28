@@ -1,11 +1,5 @@
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { v4 as uuidv4 } from 'uuid';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = path.resolve(__dirname, '../data');
-const TASKS_FILE = path.join(DATA_DIR, 'scheduled-tasks.json');
+import { getDb } from './db.js';
 
 // --- Types ---
 
@@ -42,27 +36,42 @@ export interface ScheduledTask {
   updatedAt: number;
 }
 
-interface TaskStore {
-  version: 1;
-  tasks: ScheduledTask[];
+// --- DB Helpers ---
+
+interface TaskRow {
+  id: string;
+  name: string;
+  prompt: string;
+  schedule: string;
+  mode: string;
+  status: string;
+  notification: string;
+  last_run_at: number | null;
+  next_run_at: number | null;
+  run_count: number;
+  error_count: number;
+  history: string;
+  created_at: number;
+  updated_at: number;
 }
 
-// --- Storage ---
-
-function loadStore(): TaskStore {
-  try {
-    const raw = fs.readFileSync(TASKS_FILE, 'utf-8');
-    return JSON.parse(raw) as TaskStore;
-  } catch {
-    return { version: 1, tasks: [] };
-  }
-}
-
-function saveStore(store: TaskStore): void {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  const tmp = TASKS_FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(store, null, 2));
-  fs.renameSync(tmp, TASKS_FILE);
+function rowToTask(row: TaskRow): ScheduledTask {
+  return {
+    id: row.id,
+    name: row.name,
+    prompt: row.prompt,
+    schedule: JSON.parse(row.schedule),
+    mode: row.mode,
+    status: row.status as ScheduledTask['status'],
+    notification: JSON.parse(row.notification),
+    lastRunAt: row.last_run_at,
+    nextRunAt: row.next_run_at,
+    runCount: row.run_count,
+    errorCount: row.error_count,
+    history: JSON.parse(row.history),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
 }
 
 // --- Schedule Calculation ---
@@ -75,7 +84,6 @@ export function calculateNextRun(task: ScheduledTask): number | null {
       const interval = task.schedule.intervalMs!;
       const base = task.lastRunAt ?? task.createdAt;
       let next = base + interval;
-      // If next is in the past, advance to next future occurrence
       while (next <= now) {
         next += interval;
       }
@@ -83,12 +91,11 @@ export function calculateNextRun(task: ScheduledTask): number | null {
     }
 
     case 'cron': {
-      // Simple cron parsing for common patterns
       return parseCronNext(task.schedule.cron!, now);
     }
 
     case 'once': {
-      if (task.runCount > 0) return null; // Already ran
+      if (task.runCount > 0) return null;
       return task.schedule.runAt ?? null;
     }
 
@@ -98,26 +105,21 @@ export function calculateNextRun(task: ScheduledTask): number | null {
 }
 
 function parseCronNext(cron: string, from: number): number {
-  // Very simple cron parser supporting: minute hour dayOfMonth month dayOfWeek
   const parts = cron.trim().split(/\s+/);
-  if (parts.length !== 5) return from + 60000; // Default: 1 minute from now
+  if (parts.length !== 5) return from + 60000;
 
   const [minSpec, hourSpec, , , dowSpec] = parts;
   const now = new Date(from);
 
-  // Parse minute
   const targetMin = minSpec === '*' ? -1 : parseInt(minSpec, 10);
-  // Parse hour
   const targetHour = hourSpec === '*' ? -1 : parseInt(hourSpec, 10);
-  // Parse day of week (0=Sun, 6=Sat)
   const targetDow = dowSpec === '*' ? -1 : parseInt(dowSpec, 10);
 
-  // Simple approach: iterate forward by minute until we find a match
   const candidate = new Date(now);
   candidate.setSeconds(0, 0);
-  candidate.setMinutes(candidate.getMinutes() + 1); // Start from next minute
+  candidate.setMinutes(candidate.getMinutes() + 1);
 
-  for (let i = 0; i < 60 * 24 * 8; i++) { // Max 8 days ahead
+  for (let i = 0; i < 60 * 24 * 8; i++) {
     const matches =
       (targetMin === -1 || candidate.getMinutes() === targetMin) &&
       (targetHour === -1 || candidate.getHours() === targetHour) &&
@@ -129,7 +131,7 @@ function parseCronNext(cron: string, from: number): number {
     candidate.setMinutes(candidate.getMinutes() + 1);
   }
 
-  return from + 3600000; // Fallback: 1 hour
+  return from + 3600000;
 }
 
 // --- Natural Language Schedule Parsing ---
@@ -137,7 +139,6 @@ function parseCronNext(cron: string, from: number): number {
 export function parseNaturalSchedule(text: string): ScheduleConfig | null {
   const lower = text.toLowerCase().trim();
 
-  // "every X minutes/hours"
   const intervalMatch = lower.match(/every\s+(\d+)\s*(minute|min|hour|hr|second|sec)s?/);
   if (intervalMatch) {
     const amount = parseInt(intervalMatch[1], 10);
@@ -149,17 +150,14 @@ export function parseNaturalSchedule(text: string): ScheduleConfig | null {
     return { type: 'interval', intervalMs: ms };
   }
 
-  // "every hour"
   if (/every\s+hour/.test(lower)) {
     return { type: 'interval', intervalMs: 3600000 };
   }
 
-  // "every minute"
   if (/every\s+minute/.test(lower)) {
     return { type: 'interval', intervalMs: 60000 };
   }
 
-  // "every day at Xam/pm"
   const dailyMatch = lower.match(/every\s+day\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/);
   if (dailyMatch) {
     let hour = parseInt(dailyMatch[1], 10);
@@ -169,7 +167,6 @@ export function parseNaturalSchedule(text: string): ScheduleConfig | null {
     return { type: 'cron', cron: `${min} ${hour} * * *` };
   }
 
-  // "every Monday/Tuesday/... at Xam/pm"
   const weekdayMap: Record<string, number> = {
     sunday: 0, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6,
     sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6,
@@ -184,7 +181,6 @@ export function parseNaturalSchedule(text: string): ScheduleConfig | null {
     return { type: 'cron', cron: `${min} ${hour} * * ${dow}` };
   }
 
-  // "in X minutes/hours"
   const inMatch = lower.match(/in\s+(\d+)\s*(minute|min|hour|hr|second|sec)s?/);
   if (inMatch) {
     const amount = parseInt(inMatch[1], 10);
@@ -202,9 +198,12 @@ export function parseNaturalSchedule(text: string): ScheduleConfig | null {
 // --- Task CRUD ---
 
 export function createTask(name: string, prompt: string, schedule: ScheduleConfig, mode: string = 'auto'): ScheduledTask {
-  const store = loadStore();
+  const db = getDb();
+  const now = Date.now();
+  const id = uuidv4();
+
   const task: ScheduledTask = {
-    id: uuidv4(),
+    id,
     name,
     prompt,
     schedule,
@@ -216,51 +215,60 @@ export function createTask(name: string, prompt: string, schedule: ScheduleConfi
     runCount: 0,
     errorCount: 0,
     history: [],
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
+    createdAt: now,
+    updatedAt: now,
   };
   task.nextRunAt = calculateNextRun(task);
-  store.tasks.push(task);
-  saveStore(store);
+
+  db.prepare(`
+    INSERT INTO scheduled_tasks (id, name, prompt, schedule, mode, status, notification, last_run_at, next_run_at, run_count, error_count, history, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id, name, prompt, JSON.stringify(schedule), mode, 'active',
+    JSON.stringify(task.notification), null, task.nextRunAt,
+    0, 0, '[]', now, now,
+  );
+
   return task;
 }
 
 export function listTasks(): ScheduledTask[] {
-  return loadStore().tasks;
+  const db = getDb();
+  const rows = db.prepare('SELECT * FROM scheduled_tasks ORDER BY created_at DESC').all() as TaskRow[];
+  return rows.map(rowToTask);
 }
 
 export function getTask(id: string): ScheduledTask | undefined {
-  return loadStore().tasks.find((t) => t.id === id);
+  const db = getDb();
+  const row = db.prepare('SELECT * FROM scheduled_tasks WHERE id = ?').get(id) as TaskRow | undefined;
+  return row ? rowToTask(row) : undefined;
 }
 
 export function pauseTask(id: string): boolean {
-  const store = loadStore();
-  const task = store.tasks.find((t) => t.id === id);
-  if (!task) return false;
-  task.status = 'paused';
-  task.updatedAt = Date.now();
-  saveStore(store);
-  return true;
+  const db = getDb();
+  const result = db.prepare('UPDATE scheduled_tasks SET status = ?, updated_at = ? WHERE id = ?').run('paused', Date.now(), id);
+  return result.changes > 0;
 }
 
 export function resumeTask(id: string): boolean {
-  const store = loadStore();
-  const task = store.tasks.find((t) => t.id === id);
-  if (!task) return false;
+  const db = getDb();
+  const row = db.prepare('SELECT * FROM scheduled_tasks WHERE id = ?').get(id) as TaskRow | undefined;
+  if (!row) return false;
+
+  const task = rowToTask(row);
   task.status = 'active';
   task.nextRunAt = calculateNextRun(task);
-  task.updatedAt = Date.now();
-  saveStore(store);
+
+  db.prepare('UPDATE scheduled_tasks SET status = ?, next_run_at = ?, updated_at = ? WHERE id = ?')
+    .run('active', task.nextRunAt, Date.now(), id);
+
   return true;
 }
 
 export function deleteTask(id: string): boolean {
-  const store = loadStore();
-  const index = store.tasks.findIndex((t) => t.id === id);
-  if (index === -1) return false;
-  store.tasks.splice(index, 1);
-  saveStore(store);
-  return true;
+  const db = getDb();
+  const result = db.prepare('DELETE FROM scheduled_tasks WHERE id = ?').run(id);
+  return result.changes > 0;
 }
 
 export function getTaskHistory(id: string): RunResult[] {
@@ -269,15 +277,15 @@ export function getTaskHistory(id: string): RunResult[] {
 }
 
 export function recordTaskRun(id: string, result: RunResult): void {
-  const store = loadStore();
-  const task = store.tasks.find((t) => t.id === id);
-  if (!task) return;
+  const db = getDb();
+  const row = db.prepare('SELECT * FROM scheduled_tasks WHERE id = ?').get(id) as TaskRow | undefined;
+  if (!row) return;
 
+  const task = rowToTask(row);
   task.lastRunAt = result.completedAt;
   task.runCount++;
   if (result.status === 'error') task.errorCount++;
 
-  // Keep last 50 history entries
   task.history.push(result);
   if (task.history.length > 50) {
     task.history = task.history.slice(-50);
@@ -285,13 +293,14 @@ export function recordTaskRun(id: string, result: RunResult): void {
 
   task.nextRunAt = calculateNextRun(task);
 
-  // Mark 'once' tasks as completed
   if (task.schedule.type === 'once') {
     task.status = 'completed';
   }
 
-  task.updatedAt = Date.now();
-  saveStore(store);
+  db.prepare(`
+    UPDATE scheduled_tasks SET last_run_at = ?, run_count = ?, error_count = ?, history = ?, next_run_at = ?, status = ?, updated_at = ?
+    WHERE id = ?
+  `).run(task.lastRunAt, task.runCount, task.errorCount, JSON.stringify(task.history), task.nextRunAt, task.status, Date.now(), id);
 }
 
 // --- Scheduler Loop ---
@@ -304,10 +313,10 @@ export function startScheduler(runFn: (task: ScheduledTask) => Promise<RunResult
   console.log('[scheduler] Starting scheduler loop (30s interval)');
 
   schedulerTimer = setInterval(async () => {
-    const store = loadStore();
+    const tasks = listTasks();
     const now = Date.now();
 
-    for (const task of store.tasks) {
+    for (const task of tasks) {
       if (task.status !== 'active') continue;
       if (!task.nextRunAt || task.nextRunAt > now) continue;
 

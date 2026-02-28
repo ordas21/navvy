@@ -1,15 +1,6 @@
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { v4 as uuidv4 } from 'uuid';
+import { getDb } from './db.js';
 import { getCheckpointSession } from './checkpoints.js';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = path.resolve(__dirname, '../data');
-const WORKFLOWS_DIR = path.join(DATA_DIR, 'workflows');
-
-// Ensure dir exists
-fs.mkdirSync(WORKFLOWS_DIR, { recursive: true });
 
 // --- Types ---
 
@@ -40,89 +31,78 @@ export interface Workflow {
   runCount: number;
 }
 
-// --- Storage ---
+// --- DB Helpers ---
 
-function workflowFilePath(id: string): string {
-  const safeId = id.replace(/[^a-zA-Z0-9_-]/g, '_');
-  return path.join(WORKFLOWS_DIR, `${safeId}.json`);
+interface WorkflowRow {
+  id: string;
+  name: string;
+  variables: string;
+  steps: string;
+  tags: string;
+  run_count: number;
+  created_at: number;
+  updated_at: number;
 }
 
-function loadWorkflow(id: string): Workflow | null {
-  try {
-    const raw = fs.readFileSync(workflowFilePath(id), 'utf-8');
-    return JSON.parse(raw) as Workflow;
-  } catch {
-    return null;
-  }
-}
-
-function saveWorkflow(workflow: Workflow): void {
-  const tmp = workflowFilePath(workflow.id) + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(workflow, null, 2));
-  fs.renameSync(tmp, workflowFilePath(workflow.id));
+function rowToWorkflow(row: WorkflowRow): Workflow {
+  return {
+    id: row.id,
+    name: row.name,
+    variables: JSON.parse(row.variables),
+    steps: JSON.parse(row.steps),
+    tags: JSON.parse(row.tags),
+    runCount: row.run_count,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
 }
 
 // --- Public API ---
 
 export function createWorkflow(name: string, steps: WorkflowStep[], variables: WorkflowVariable[] = [], tags: string[] = []): Workflow {
-  const workflow: Workflow = {
-    id: `wf-${uuidv4().substring(0, 8)}`,
-    name,
-    variables,
-    steps,
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-    tags,
-    runCount: 0,
-  };
-  saveWorkflow(workflow);
-  return workflow;
+  const db = getDb();
+  const now = Date.now();
+  const id = `wf-${uuidv4().substring(0, 8)}`;
+
+  db.prepare(`
+    INSERT INTO workflows (id, name, variables, steps, tags, run_count, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+  `).run(id, name, JSON.stringify(variables), JSON.stringify(steps), JSON.stringify(tags), now, now);
+
+  return { id, name, variables, steps, createdAt: now, updatedAt: now, tags, runCount: 0 };
 }
 
 export function getWorkflow(id: string): Workflow | null {
-  return loadWorkflow(id);
+  const db = getDb();
+  const row = db.prepare('SELECT * FROM workflows WHERE id = ?').get(id) as WorkflowRow | undefined;
+  return row ? rowToWorkflow(row) : null;
 }
 
 export function listWorkflows(): Array<{ id: string; name: string; stepCount: number; tags: string[]; runCount: number; updatedAt: number }> {
-  try {
-    const files = fs.readdirSync(WORKFLOWS_DIR).filter((f) => f.endsWith('.json'));
-    return files.map((f) => {
-      try {
-        const raw = fs.readFileSync(path.join(WORKFLOWS_DIR, f), 'utf-8');
-        const wf = JSON.parse(raw) as Workflow;
-        return {
-          id: wf.id,
-          name: wf.name,
-          stepCount: wf.steps.length,
-          tags: wf.tags,
-          runCount: wf.runCount,
-          updatedAt: wf.updatedAt,
-        };
-      } catch {
-        return null;
-      }
-    }).filter((w): w is NonNullable<typeof w> => w !== null);
-  } catch {
-    return [];
-  }
+  const db = getDb();
+  const rows = db.prepare('SELECT * FROM workflows ORDER BY updated_at DESC').all() as WorkflowRow[];
+  return rows.map((row) => {
+    const wf = rowToWorkflow(row);
+    return {
+      id: wf.id,
+      name: wf.name,
+      stepCount: wf.steps.length,
+      tags: wf.tags,
+      runCount: wf.runCount,
+      updatedAt: wf.updatedAt,
+    };
+  });
 }
 
 export function deleteWorkflow(id: string): boolean {
-  try {
-    fs.unlinkSync(workflowFilePath(id));
-    return true;
-  } catch {
-    return false;
-  }
+  const db = getDb();
+  const result = db.prepare('DELETE FROM workflows WHERE id = ?').run(id);
+  return result.changes > 0;
 }
 
 export function incrementWorkflowRunCount(id: string): void {
-  const workflow = loadWorkflow(id);
-  if (workflow) {
-    workflow.runCount++;
-    workflow.updatedAt = Date.now();
-    saveWorkflow(workflow);
-  }
+  const db = getDb();
+  db.prepare('UPDATE workflows SET run_count = run_count + 1, updated_at = ? WHERE id = ?').run(Date.now(), id);
 }
 
 // --- Variable Substitution ---
